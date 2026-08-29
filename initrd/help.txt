@@ -1,0 +1,1 @@
+"These are the helping commands mortal :\n 1. clear\n 2. hail\n 3. alloc/malloc\n 4. uptime\n 5. cat <filename>\n 6. help\n 7. ls\n"
