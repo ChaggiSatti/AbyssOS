@@ -12,6 +12,7 @@
 #include "initrd.h"
 #include "vesa.h"
 #include "mouse.h"
+#include "ui.h"
 
 extern "C" void jump_usermode();
 extern "C" void test_user_function(){
@@ -45,6 +46,7 @@ extern "C" void kernel_main(multiboot_info* mbd){
     idt_init();
     pic_remap(32, 40);
     init_paging();
+    memory_init();
     timer_init(100);
     init_tasking();
     vesa_init((uint32_t)mbd->framebuffer_addr, mbd->framebuffer_width, mbd->framebuffer_height, mbd->framebuffer_pitch);
@@ -80,10 +82,14 @@ extern "C" void kernel_main(multiboot_info* mbd){
 
     // create_task(t1, task_a);
     // create_task(t2, task_b);
-    
-    while(1){}
-    // asm volatile ("int $0x8");
     asm volatile ("sti");
+    while(1){
+        ui_render();
+        asm volatile ("hlt");
+    }
+    // while(1){}
+    // asm volatile ("int $0x8");
+    // asm volatile ("sti");
     // jump_usermode();
-    while(1){}
+    // while(1){}
 }

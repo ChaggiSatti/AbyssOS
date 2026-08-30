@@ -1,9 +1,11 @@
 #include "vesa.h"
 #include "font8x8.h"
+#include "memory.h"
 
 // #include <stdlib.h>
 
-static uint32_t* framebuffer;
+uint32_t* framebuffer;
+uint32_t* backbuffer;
 static uint32_t  fb_width;
 static uint32_t  fb_height;
 static uint32_t  fb_pitch;
@@ -13,11 +15,30 @@ void vesa_init(uint32_t addr, uint32_t width, uint32_t height, uint32_t pitch) {
     fb_width    = width;
     fb_height   = height;
     fb_pitch    = pitch;
+
+    backbuffer = (uint32_t*)malloc(width * height * 4);
 }
+void vesa_swap_buffers() {
+    uint32_t total_pixels = fb_width * fb_height;
+    uint32_t* src = backbuffer;
+    uint32_t* dst = framebuffer;
+    
+    // Hardware-accelerated memory copy
+    asm volatile (
+        "cld; rep movsl"
+        : "+S" (src), "+D" (dst), "+c" (total_pixels)
+        :
+        : "memory"
+    );
+}
+
+
 void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (x >= fb_width || y >= fb_height) return;
-    uint32_t offset = y * (fb_pitch / 4) + x;
-    framebuffer[offset] = color;
+    uint32_t index = y * fb_width + x;
+    backbuffer[index] = color;
+    // uint32_t offset = y * (fb_pitch / 4) + x;
+    // framebuffer[offset] = color;
 }
 uint8_t color_r(uint32_t c){
     return (c >> 16) & 0xFF;
@@ -54,12 +75,22 @@ void draw_gradient_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t
     }
 }
 void draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color){
-    for(uint32_t i = 0; i < height; i++){
-        for(uint32_t j = 0; j < width; j++){
-            put_pixel(j + x, i + y, color);
+    // Safety clipping
+    if (x >= fb_width || y >= fb_height) return;
+    if (x + width > fb_width) width = fb_width - x;
+    if (y + height > fb_height) height = fb_height - y;
+    
+    for (uint32_t i = 0; i < height; i++) {
+        // Calculate the row exactly once
+        uint32_t* row_ptr = &backbuffer[(y + i) * fb_width + x];
+        
+        // Fast fill across the row
+        for (uint32_t j = 0; j < width; j++) {
+            row_ptr[j] = color;
         }
     }
 }
+
 //Bresenham's line algo...
 void draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
     int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1); //abs(x1 - x0);

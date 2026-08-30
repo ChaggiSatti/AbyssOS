@@ -1,10 +1,15 @@
 #pragma once
 #include <stdint.h>
+
 uint8_t color_r(uint32_t c);
 uint8_t color_g(uint32_t c);
 uint8_t color_b(uint32_t c);
 uint32_t get_pixel(uint32_t x, uint32_t y);
+extern uint32_t* framebuffer;
+extern uint32_t* backbuffer; 
 
+// void vesa_init(uint32_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch);
+void vesa_swap_buffers();
 void draw_gradient_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,uint32_t color1, uint32_t color2);
 void vesa_init(uint32_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch);
 void put_pixel(uint32_t x, uint32_t y, uint32_t color);

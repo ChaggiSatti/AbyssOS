@@ -791,8 +791,126 @@ if (*str == '\n') {
 \textbf{Solution:} Dropped the generic approach and directly wired \texttt{isr44} into \texttt{boot/interrupts.asm}, added the gate to \texttt{kernel/idt.cpp}, and exposed \texttt{extern "C" void isr44\_handler()} natively in \texttt{mouse.cpp}.
 
 \newpage
+
+\section{Phase 20: The Graphical User Interface \& Double Buffering}
+{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
+\subsection{The Double Buffering Architecture}
+When the mouse driver was first implemented, it wrote directly to the VESA video memory (\texttt{framebuffer}). This meant the driver had to manually save the background pixels before drawing the cursor, and restore them when the cursor moved. However, because the background was a complex gradient, overlapping movements caused pixel corruption.
+To solve this, we implemented Double Buffering. A 3.1 MB \texttt{backbuffer} was allocated on the heap. This exposed a critical memory bug: our initial bump allocator (\texttt{kmalloc}) was hard-capped at 4MB, and was never initialized in \texttt{kernel\_main}. We expanded the heap limit to 32MB and correctly initialized the memory subsystem. 
+All drawing functions (\texttt{put\_pixel}, \texttt{draw\_rect}) were refactored to draw to the backbuffer in software.
+
+\subsection{The Compositor Loop}
+A new \texttt{ui\_render()} function was created to act as a Compositor. Instead of the kernel sleeping permanently, the UI loop clears the backbuffer, draws the gradient, draws any active GUI Windows, draws the mouse cursor on top, and finally swaps the buffers to the screen using a blistering-fast inline assembly instruction: \texttt{rep movsl}.
+
+\section{Phase 21: The Interactive Desktop}
+{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
+\subsection{Click Detection and Z-Order Promotion}
+The PS/2 Mouse packet's first byte contains the button states. We extracted Bit 0 to track \texttt{mouse\_left\_pressed}. We introduced a \texttt{Window} struct to hold window coordinates, dimensions, and drag states.
+In the compositor loop, a reverse-iteration (Z-Order) collision detection was implemented. If the user clicks the title bar of a window, it is pulled from its current Z-index, shifted to the end of the rendering array (promoting it to the foreground), and its offset is recorded to allow smooth dragging without snapping to the cursor center.
+
+\newpage
 \section{Complete Source Code}
-This section contains the full, unabridged source code for Abyss OS up to Phase 19.\par\bigskip
+
+\subsection{Makefile}
+\begin{lstlisting}[language={bash}]
+CC = i686-elf-g++
+ASM = nasm
+LD = i686-elf-ld
+
+CFLAGS = -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti
+LDFLAGS = -T linker.ld -ffreestanding -O2 -nostdlib
+
+all: abyss.iso
+
+boot/boot.o: boot/boot.asm
+	$(ASM) -f elf32 boot/boot.asm -o boot/boot.o
+
+boot/gdt_flush.o: boot/gdt_flush.asm
+	$(ASM) -f elf32 boot/gdt_flush.asm -o boot/gdt_flush.o
+
+boot/idt_flush.o: boot/idt_flush.asm
+	$(ASM) -f elf32 boot/idt_flush.asm -o boot/idt_flush.o
+
+boot/interrupts.o: boot/interrupts.asm
+	$(ASM) -f elf32 boot/interrupts.asm -o boot/interrupts.o
+
+boot/paging.o: boot/paging.asm
+	$(ASM) -f elf32 boot/paging.asm -o boot/paging.o
+
+boot/usermode.o: boot/usermode.asm
+	$(ASM) -f elf32 boot/usermode.asm -o boot/usermode.o
+
+boot/task.o: boot/task.asm
+	$(ASM) -f elf32 boot/task.asm -o boot/task.o
+
+kernel/kernel.o: kernel/kernel.cpp
+	$(CC) $(CFLAGS) -c kernel/kernel.cpp -o kernel/kernel.o
+
+kernel/gdt.o: kernel/gdt.cpp
+	$(CC) $(CFLAGS) -c kernel/gdt.cpp -o kernel/gdt.o
+
+kernel/idt.o: kernel/idt.cpp
+	$(CC) $(CFLAGS) -c kernel/idt.cpp -o kernel/idt.o
+
+kernel/vga.o: kernel/vga.cpp
+	$(CC) $(CFLAGS) -c kernel/vga.cpp -o kernel/vga.o
+
+kernel/isr.o: kernel/isr.cpp
+	$(CC) $(CFLAGS) -c kernel/isr.cpp -o kernel/isr.o
+
+kernel/pic.o: kernel/pic.cpp
+	$(CC) $(CFLAGS) -c kernel/pic.cpp -o kernel/pic.o
+
+kernel/paging.o: kernel/paging.cpp	
+	$(CC) $(CFLAGS) -c kernel/paging.cpp -o kernel/paging.o
+
+kernel/string.o: kernel/string.cpp
+	$(CC) $(CFLAGS) -c kernel/string.cpp -o kernel/string.o
+
+kernel/tss.o: kernel/tss.cpp
+	$(CC) $(CFLAGS) -c kernel/tss.cpp -o kernel/tss.o
+
+kernel/memory.o: kernel/memory.cpp
+	$(CC) $(CFLAGS) -c kernel/memory.cpp -o kernel/memory.o
+
+kernel/timer.o: kernel/timer.cpp
+	$(CC) $(CFLAGS) -c kernel/timer.cpp -o kernel/timer.o 
+
+kernel/task.o: kernel/task.cpp
+	$(CC) $(CFLAGS) -c kernel/task.cpp -o kernel/task.o
+
+kernel/vfs.o: kernel/vfs.cpp
+	$(CC) $(CFLAGS) -c kernel/vfs.cpp -o kernel/vfs.o 
+
+kernel/initrd.o: kernel/initrd.cpp
+	$(CC) $(CFLAGS) -c kernel/initrd.cpp -o kernel/initrd.o 
+
+kernel/vesa.o: kernel/vesa.cpp
+	$(CC) $(CFLAGS) -c kernel/vesa.cpp -o kernel/vesa.o
+
+kernel/mouse.o: kernel/mouse.cpp
+	$(CC) $(CFLAGS) -c kernel/mouse.cpp -o kernel/mouse.o 
+
+kernel/ui.o: kernel/ui.cpp
+	$(CC) $(CFLAGS) -c kernel/ui.cpp -o kernel/ui.o
+
+abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o 
+	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o
+
+abyss.iso: abyss.bin
+	cp abyss.bin iso/boot/abyss.bin
+	cd initrd && tar --format=ustar -cvf ../iso/boot/initrd.tar *
+	grub-mkrescue -o abyss.iso iso
+
+run: abyss.iso
+# 	qemu-system-i386 -cdrom abyss.iso
+	qemu-system-i386 -cdrom abyss.iso -vga std
+
+clean:
+	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o
+
+\end{lstlisting}
+
 \subsection{boot.asm}
 \begin{lstlisting}[language={[x86masm]Assembler}]
 MAGIC    equ 0x1BADB002
@@ -828,6 +946,7 @@ _start:
 .hang:
     hlt
     jmp .hang
+
 \end{lstlisting}
 
 \subsection{gdt\_flush.asm}
@@ -963,6 +1082,7 @@ isr44:
     call isr44_handler
     popa
     iret
+
 \end{lstlisting}
 
 \subsection{paging.asm}
@@ -1000,6 +1120,7 @@ enable_paging:
     mov esp, ebp
     pop ebp
     ret
+
 \end{lstlisting}
 
 \subsection{task.asm}
@@ -1038,6 +1159,7 @@ perform_task_switch:
     ; 7. Because C++ called this function, 'ret' automatically pops the 
     ;    Instruction Pointer (EIP) off the stack and jumps to it!
     ret
+
 \end{lstlisting}
 
 \subsection{usermode.asm}
@@ -1066,6 +1188,19 @@ jump_usermode:
 
     ; 3. Execute the fake return!
     iret
+
+\end{lstlisting}
+
+\subsection{hello.txt}
+\begin{lstlisting}[language={bash}]
+Greetings from the Abyss' Virtual file system, mortal!!
+
+\end{lstlisting}
+
+\subsection{help.txt}
+\begin{lstlisting}[language={bash}]
+"These are the helping commands mortal :\n 1. clear\n 2. hail\n 3. alloc/malloc\n 4. uptime\n 5. cat <filename>\n 6. help\n 7. ls\n"
+
 \end{lstlisting}
 
 \subsection{gdt.cpp}
@@ -1100,6 +1235,7 @@ void gdt_init(){
     gdtr.base = (uint32_t)&gdt;
     gdt_flush(&gdtr);
 }
+
 
 \end{lstlisting}
 
@@ -1457,6 +1593,7 @@ extern "C" void isr33_handler() {
     }
     pic_send_eoi(1); 
 }
+
 \end{lstlisting}
 
 \subsection{kernel.cpp}
@@ -1475,6 +1612,7 @@ extern "C" void isr33_handler() {
 #include "initrd.h"
 #include "vesa.h"
 #include "mouse.h"
+#include "ui.h"
 
 extern "C" void jump_usermode();
 extern "C" void test_user_function(){
@@ -1508,13 +1646,14 @@ extern "C" void kernel_main(multiboot_info* mbd){
     idt_init();
     pic_remap(32, 40);
     init_paging();
+    memory_init();
     timer_init(100);
     init_tasking();
     vesa_init((uint32_t)mbd->framebuffer_addr, mbd->framebuffer_width, mbd->framebuffer_height, mbd->framebuffer_pitch);
     mouse_init();
     vga_clear();
-    // draw_rect(0, 0, 1024, 768, 0x000000);
-    draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
+    draw_rect(0, 0, 1024, 768, 0x000000);
+    // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
     vga_print("Abyss v1.0 loading...\nLoading Virtual File System...\nFiles loaded...\n...\n...\nHello Mortal...");
     if (mbd->mods_count > 0) {
         multiboot_mod_list* mod = (multiboot_mod_list*)mbd->mods_addr;
@@ -1543,12 +1682,16 @@ extern "C" void kernel_main(multiboot_info* mbd){
 
     // create_task(t1, task_a);
     // create_task(t2, task_b);
-    
-    while(1){}
-    // asm volatile ("int $0x8");
     asm volatile ("sti");
+    while(1){
+        ui_render();
+        asm volatile ("hlt");
+    }
+    // while(1){}
+    // asm volatile ("int $0x8");
+    // asm volatile ("sti");
     // jump_usermode();
-    while(1){}
+    // while(1){}
 }
 \end{lstlisting}
 
@@ -1592,6 +1735,7 @@ const char kbdus[128] = {
     0,  /* F12 Key */
     0, /* All other keys are undefined */
 };
+
 \end{lstlisting}
 
 \subsection{memory.cpp}
@@ -1608,7 +1752,7 @@ void memory_init(){
 void* malloc(size_t size){
     uint32_t allocated_address = current_heap_pointer;
     current_heap_pointer+=size;
-    if(current_heap_pointer >= 0x400000){
+    if(current_heap_pointer >= 0x2000000){
         vga_print("The Abyss is filled with your trash, mortal\n");
         while(1){
             asm volatile("cli; hlt");
@@ -1634,41 +1778,33 @@ void* malloc(size_t size);
 #include "io.h"
 #include "vesa.h"
 #include "pic.h"
+#include "ui.h" // We will create this next!
 
 int mouse_x = 512;
 int mouse_y = 384;
 uint8_t mouse_cycle = 0;
 uint8_t mouse_byte[3];
+bool mouse_left_pressed = false; 
 
-// --- NEW ARROW DATA ---
-// A classic 10x15 pointer arrow
 const int CURSOR_W = 10;
 const int CURSOR_H = 15;
-
 const uint8_t cursor_bitmap[15][10] = {
-    {1,0,0,0,0,0,0,0,0,0},
-    {1,1,0,0,0,0,0,0,0,0},
-    {1,2,1,0,0,0,0,0,0,0},
-    {1,2,2,1,0,0,0,0,0,0},
-    {1,2,2,2,1,0,0,0,0,0},
-    {1,2,2,2,2,1,0,0,0,0},
-    {1,2,2,2,2,2,1,0,0,0},
-    {1,2,2,2,2,2,2,1,0,0},
-    {1,2,2,2,2,2,2,2,1,0},
-    {1,2,2,2,2,2,2,2,2,1},
-    {1,2,2,2,2,1,1,1,1,1},
-    {1,2,2,1,2,1,0,0,0,0},
-    {1,2,1,0,1,2,1,0,0,0},
-    {1,1,0,0,1,2,1,0,0,0},
-    {1,0,0,0,0,1,1,0,0,0}
+    {2,0,0,0,0,0,0,0,0,0},
+    {2,2,0,0,0,0,0,0,0,0},
+    {2,1,2,0,0,0,0,0,0,0},
+    {2,1,1,2,0,0,0,0,0,0},
+    {2,1,1,1,2,0,0,0,0,0},
+    {2,1,1,1,1,2,0,0,0,0},
+    {2,1,1,1,1,1,2,0,0,0},
+    {2,1,1,1,1,1,1,2,0,0},
+    {2,1,1,1,1,1,1,1,2,0},
+    {2,1,1,1,1,1,1,1,1,2},
+    {2,1,1,1,1,2,2,2,2,2},
+    {2,1,1,2,1,2,0,0,0,0},
+    {2,1,2,0,2,1,2,0,0,0},
+    {2,2,0,0,2,1,2,0,0,0},
+    {2,0,0,0,0,2,2,0,0,0}
 };
-
-// uint32_t cursor_bg[5][5]; // A 5x5 pixel buffer
-uint32_t cursor_bg[15][10];  // Our new 10x15 buffer
-// ----------------------
-
-int old_mouse_x = 512;
-int old_mouse_y = 384;
 
 void mouse_wait(uint8_t type){
     uint32_t timeout = 100000;
@@ -1693,27 +1829,32 @@ uint8_t mouse_read() {
 
 void mouse_init() {
     uint8_t status;
-    
     mouse_wait(1);
     outb(0x64, 0xA8);
-    
     mouse_wait(1);
     outb(0x64, 0x20); 
     mouse_wait(0);
     status = (inb(0x60) | 2);
-    
     mouse_wait(1);
     outb(0x64, 0x60);
     mouse_wait(1);
     outb(0x60, status);
-    
     mouse_write(0xF6);
     mouse_read();
-    
     mouse_write(0xF4);
     mouse_read();
-    
-    // register_interrupt_handler(44, mouse_handler);
+}
+
+void mouse_draw() {
+    for (int i = 0; i < CURSOR_H; i++) {
+        for (int j = 0; j < CURSOR_W; j++) {
+            if (cursor_bitmap[i][j] == 1) {
+                put_pixel(mouse_x + j, mouse_y + i, 0x000000); 
+            } else if (cursor_bitmap[i][j] == 2) {
+                put_pixel(mouse_x + j, mouse_y + i, 0xFFFFFF); 
+            }
+        }
+    }
 }
 
 extern "C" void isr44_handler() {
@@ -1724,16 +1865,15 @@ extern "C" void isr44_handler() {
     }
     
     mouse_byte[mouse_cycle] = inb(0x60); 
-
     if (mouse_cycle == 0 && (mouse_byte[0] & 0x08) == 0) {
         pic_send_eoi(12);
         return;
     }
     
     mouse_cycle++; 
-
     if (mouse_cycle == 3) {
         mouse_cycle = 0; 
+        mouse_left_pressed = (mouse_byte[0] & 0x01);
         
         int d_x = (int8_t)mouse_byte[1]; 
         int d_y = (int8_t)mouse_byte[2]; 
@@ -1743,102 +1883,30 @@ extern "C" void isr44_handler() {
         
         if (mouse_x < 0) mouse_x = 0;
         if (mouse_y < 0) mouse_y = 0;
-        
-        // --- OLD 5x5 BOUNDS ---
-        // if (mouse_x > 1023 - 5) mouse_x = 1023 - 5; 
-        // if (mouse_y > 767 - 5) mouse_y = 767 - 5;   
-        
-        // --- NEW ARROW BOUNDS ---
         if (mouse_x > 1023 - CURSOR_W) mouse_x = 1023 - CURSOR_W; 
         if (mouse_y > 767 - CURSOR_H) mouse_y = 767 - CURSOR_H;   
-
-        // --- OLD 5x5 DRAWING LOGIC ---
-        // for (int i = 0; i < 5; i++) {
-        //     for (int j = 0; j < 5; j++) {
-        //         put_pixel(old_mouse_x + j, old_mouse_y + i, cursor_bg[i][j]);
-        //     }
-        // }
-        // for (int i = 0; i < 5; i++) {
-        //     for (int j = 0; j < 5; j++) {
-        //         cursor_bg[i][j] = get_pixel(mouse_x + j, mouse_y + i);
-        //     }
-        // }
-        // for (int i = 0; i < 5; i++) {
-        //     for (int j = 0; j < 5; j++) {
-        //         put_pixel(mouse_x + j, mouse_y + i, 0xFF00FF);
-        //     }
-        // }
-
-        // --- NEW ARROW DRAWING LOGIC ---
-        // 1. RESTORE
-        for (int i = 0; i < CURSOR_H; i++) {
-            for (int j = 0; j < CURSOR_W; j++) {
-                if (cursor_bitmap[i][j] != 0) {
-                    put_pixel(old_mouse_x + j, old_mouse_y + i, cursor_bg[i][j]);
-                }
-            }
-        }
-
-        // 2. SAVE
-        for (int i = 0; i < CURSOR_H; i++) {
-            for (int j = 0; j < CURSOR_W; j++) {
-                if (cursor_bitmap[i][j] != 0) {
-                    cursor_bg[i][j] = get_pixel(mouse_x + j, mouse_y + i);
-                }
-            }
-        }
-
-        // 3. DRAW
-        for (int i = 0; i < CURSOR_H; i++) {
-            for (int j = 0; j < CURSOR_W; j++) {
-                if (cursor_bitmap[i][j] == 1) {
-                    put_pixel(mouse_x + j, mouse_y + i, 0x000000); 
-                } else if (cursor_bitmap[i][j] == 2) {
-                    put_pixel(mouse_x + j, mouse_y + i, 0xFFFFFF); 
-                }
-            }
-        }
-
-        old_mouse_x = mouse_x;
-        old_mouse_y = mouse_y;
+        
+        // Signal the UI to draw a new frame!
+        needs_redraw = true;
     }
-    
     pic_send_eoi(12); 
 }
 
-// void mouse_handler(registers_t* regs) {
-//     uint8_t status = inb(0x64);
-//     if ((status & 0x20) == 0) return; 
-
-//     mouse_byte[mouse_cycle++] = inb(0x60);
-
-//     if (mouse_cycle == 3) {
-//         mouse_cycle = 0;
-
-//         int d_x = (int)((char)mouse_byte[1]); 
-//         int d_y = (int)((char)mouse_byte[2]); 
-        
-//         mouse_x += d_x;
-//         mouse_y -= d_y;
-        
-//         if (mouse_x < 0) mouse_x = 0;
-//         if (mouse_y < 0) mouse_y = 0;
-//         if (mouse_x > 1023) mouse_x = 1023;
-//         if (mouse_y > 767) mouse_y = 767;
-
-//         put_pixel(mouse_x, mouse_y, 0xFF0000); 
-//     }
-// }
 \end{lstlisting}
 
 \subsection{mouse.h}
 \begin{lstlisting}[language={C++}]
-#pragma once 
+#pragma once
 #include <stdint.h>
-// #include "isr.h"
+
+extern int mouse_x;
+extern int mouse_y;
+extern uint8_t mouse_byte[3];
+extern bool mouse_left_pressed;
 
 void mouse_init();
-// void mouse_handler(registers_t* regs);
+void mouse_draw();
+
 \end{lstlisting}
 
 \subsection{multiboot.h}
@@ -1888,6 +1956,7 @@ struct multiboot_mod_list {
     uint32_t cmdline;
     uint32_t pad;
 } __attribute__((packed));
+
 \end{lstlisting}
 
 \subsection{paging.cpp}
@@ -1919,6 +1988,7 @@ void init_paging() {
     load_page_directory(page_directory.tablesPhysical);
     enable_paging();
 }
+
 \end{lstlisting}
 
 \subsection{paging.h}
@@ -1995,6 +2065,7 @@ void pic_send_eoi(unsigned char irq) {
     
     outb(PIC1_COMMAND, 0x20); // Send to Master
 }
+
 \end{lstlisting}
 
 \subsection{pic.h}
@@ -2166,6 +2237,7 @@ void tss_init(uint32_t kernel_stack) {
     tss.iomap_base = sizeof(tss);
     asm volatile("ltr %%ax" : : "a"(0x2B));
 }
+
 \end{lstlisting}
 
 \subsection{tss.h}
@@ -2192,16 +2264,157 @@ struct tss_entry_t {
 } __attribute__((packed));
 
 void tss_init(uint32_t kernel_stack);
+
+\end{lstlisting}
+
+\subsection{ui.cpp}
+\begin{lstlisting}[language={C++}]
+#include "ui.h"
+#include "vesa.h"
+#include "mouse.h"
+
+bool needs_redraw = true; // Always draw the very first frame
+
+Window windows[2] = {
+    {100, 100, 400, 300, "Abyss OS Settings", false, 0, 0},
+    {550, 250, 400, 200, "System Monitor", false, 0, 0}
+};
+int num_windows = 2;
+
+void draw_window(uint32_t x, uint32_t y, uint32_t width, uint32_t height, const char* title) {
+    // Window Body
+    draw_rect(x, y, width, height, 0xCCCCCC); // Light gray
+    
+    // Window Borders (Creates a slight 90s 3D pop-out effect)
+    draw_rect(x, y, width, 1, 0xFFFFFF); // Top
+    draw_rect(x, y, 1, height, 0xFFFFFF); // Left
+    draw_rect(x + width - 1, y, 1, height, 0x555555); // Right
+    draw_rect(x, y + height - 1, width, 1, 0x555555); // Bottom
+    
+    // Title Bar
+    draw_rect(x + 2, y + 2, width - 4, 20, 0x0000AA); // Dark blue title bar
+    draw_string(title, x + 6, y + 8, 0xFFFFFF, 0x0000AA, 2); // White text
+}
+
+bool is_any_window_dragged = false;
+
+void ui_update() {
+    // 1. If the mouse is released, drop everything
+    if (!mouse_left_pressed) {
+        for (int i = 0; i < num_windows; i++) {
+            windows[i].is_dragged = false;
+        }
+        is_any_window_dragged = false;
+        return;
+    }
+
+    // 2. If we are currently dragging a window, ONLY update that specific window
+    if (is_any_window_dragged) {
+        for (int i = 0; i < num_windows; i++) {
+            Window* w = &windows[i];
+            if (w->is_dragged) {
+                w->x = mouse_x - w->drag_offset_x;
+                w->y = mouse_y - w->drag_offset_y;
+                needs_redraw = true;
+                return; // Exit early so we don't grab other windows!
+            }
+        }
+    }
+
+    // 3. If we aren't dragging anything yet, check for a NEW click!
+    for (int i = num_windows - 1; i >= 0; i--) {
+        Window* w = &windows[i];
+        
+        // Check collision with the ENTIRE WINDOW (so clicking the body brings it to front)
+        if (mouse_x >= w->x && mouse_x <= w->x + w->width &&
+            mouse_y >= w->y && mouse_y <= w->y + w->height) {
+            
+            // Bring to front! (If it's not already on top)
+            if (i != num_windows - 1) {
+                Window clicked_window = windows[i];
+                
+                // Shift all windows above it down by 1 position
+                for (int j = i; j < num_windows - 1; j++) {
+                    windows[j] = windows[j + 1];
+                }
+                
+                // Put our clicked window at the very end of the array (the top)
+                windows[num_windows - 1] = clicked_window;
+                
+                // Re-point 'w' to the new top window so dragging works
+                w = &windows[num_windows - 1];
+            }
+            
+            // Check if they specifically clicked the Title Bar to start dragging
+            if (mouse_y <= w->y + 24) {
+                w->is_dragged = true;
+                w->drag_offset_x = mouse_x - w->x;
+                w->drag_offset_y = mouse_y - w->y;
+                is_any_window_dragged = true;
+            }
+            
+            needs_redraw = true; // Force redraw to show it popped to the front!
+            break; 
+        }
+    }
+}
+
+
+
+void ui_render() {
+    ui_update(); // Process mouse clicks first!
+    
+    if (!needs_redraw) return;
+    // 1. Draw Background
+    draw_gradient_rect(0, 0, 1024, 768, 0x100010, 0x004554);
+    
+    // 2. Draw Windows from our array
+    for (int i = 0; i < num_windows; i++) {
+        draw_window(windows[i].x, windows[i].y, windows[i].width, windows[i].height, windows[i].title);
+    }
+    // 3. Draw Mouse
+    mouse_draw();
+    // 4. Swap buffers
+    vesa_swap_buffers();
+    
+    needs_redraw = false;
+}
+
+
+
+\end{lstlisting}
+
+\subsection{ui.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+struct Window {
+    int x, y;
+    int width, height;
+    const char* title;
+    
+    // State for dragging
+    bool is_dragged;
+    int drag_offset_x;
+    int drag_offset_y;
+};
+
+extern bool needs_redraw;
+void ui_render();
+
 \end{lstlisting}
 
 \subsection{vesa.cpp}
 \begin{lstlisting}[language={C++}]
 #include "vesa.h"
 #include "font8x8.h"
+#include "memory.h"
 
 // #include <stdlib.h>
 
-static uint32_t* framebuffer;
+uint32_t* framebuffer;
+uint32_t* backbuffer;
 static uint32_t  fb_width;
 static uint32_t  fb_height;
 static uint32_t  fb_pitch;
@@ -2211,11 +2424,30 @@ void vesa_init(uint32_t addr, uint32_t width, uint32_t height, uint32_t pitch) {
     fb_width    = width;
     fb_height   = height;
     fb_pitch    = pitch;
+
+    backbuffer = (uint32_t*)malloc(width * height * 4);
 }
+void vesa_swap_buffers() {
+    uint32_t total_pixels = fb_width * fb_height;
+    uint32_t* src = backbuffer;
+    uint32_t* dst = framebuffer;
+    
+    // Hardware-accelerated memory copy
+    asm volatile (
+        "cld; rep movsl"
+        : "+S" (src), "+D" (dst), "+c" (total_pixels)
+        :
+        : "memory"
+    );
+}
+
+
 void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (x >= fb_width || y >= fb_height) return;
-    uint32_t offset = y * (fb_pitch / 4) + x;
-    framebuffer[offset] = color;
+    uint32_t index = y * fb_width + x;
+    backbuffer[index] = color;
+    // uint32_t offset = y * (fb_pitch / 4) + x;
+    // framebuffer[offset] = color;
 }
 uint8_t color_r(uint32_t c){
     return (c >> 16) & 0xFF;
@@ -2252,12 +2484,22 @@ void draw_gradient_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t
     }
 }
 void draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color){
-    for(uint32_t i = 0; i < height; i++){
-        for(uint32_t j = 0; j < width; j++){
-            put_pixel(j + x, i + y, color);
+    // Safety clipping
+    if (x >= fb_width || y >= fb_height) return;
+    if (x + width > fb_width) width = fb_width - x;
+    if (y + height > fb_height) height = fb_height - y;
+    
+    for (uint32_t i = 0; i < height; i++) {
+        // Calculate the row exactly once
+        uint32_t* row_ptr = &backbuffer[(y + i) * fb_width + x];
+        
+        // Fast fill across the row
+        for (uint32_t j = 0; j < width; j++) {
+            row_ptr[j] = color;
         }
     }
 }
+
 //Bresenham's line algo...
 void draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
     int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1); //abs(x1 - x0);
@@ -2392,17 +2634,23 @@ void draw_string(const char* str, uint32_t x, uint32_t y, uint32_t fg_color, uin
 }
 
 
+
 \end{lstlisting}
 
 \subsection{vesa.h}
 \begin{lstlisting}[language={C++}]
 #pragma once
 #include <stdint.h>
+
 uint8_t color_r(uint32_t c);
 uint8_t color_g(uint32_t c);
 uint8_t color_b(uint32_t c);
 uint32_t get_pixel(uint32_t x, uint32_t y);
+extern uint32_t* framebuffer;
+extern uint32_t* backbuffer; 
 
+// void vesa_init(uint32_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch);
+void vesa_swap_buffers();
 void draw_gradient_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,uint32_t color1, uint32_t color2);
 void vesa_init(uint32_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch);
 void put_pixel(uint32_t x, uint32_t y, uint32_t color);
@@ -2412,6 +2660,7 @@ void draw_circle(int xc, int yc, int r, uint32_t color);
 void fill_circle(int xc, int yc, int r, uint32_t color);
 void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color, int scale);
 void draw_string(const char* str, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color, int scale);
+
 
 
 \end{lstlisting}
@@ -2544,6 +2793,19 @@ void vga_clear();
 void vga_putchar(char);
 void vga_print_char(const char);
 void vga_print(const char*);
+\end{lstlisting}
+
+\subsection{linker.ld}
+\begin{lstlisting}[language={bash}]
+ENTRY(_start)
+
+SECTIONS{
+    . = 0x100000;
+    .text : { *(.multiboot) *(.text) }
+    .rodata : { *(.rodata) }
+    .data : { *(.data) }
+    .bss : { *(COMMON) *(.bss) }
+}
 \end{lstlisting}
 
 \end{document}

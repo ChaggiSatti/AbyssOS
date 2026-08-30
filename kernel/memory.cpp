@@ -10,7 +10,7 @@ void memory_init(){
 void* malloc(size_t size){
     uint32_t allocated_address = current_heap_pointer;
     current_heap_pointer+=size;
-    if(current_heap_pointer >= 0x400000){
+    if(current_heap_pointer >= 0x2000000){
         vga_print("The Abyss is filled with your trash, mortal\n");
         while(1){
             asm volatile("cli; hlt");

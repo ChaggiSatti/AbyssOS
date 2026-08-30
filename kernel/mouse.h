@@ -1,6 +1,10 @@
-#pragma once 
+#pragma once
 #include <stdint.h>
-// #include "isr.h"
+
+extern int mouse_x;
+extern int mouse_y;
+extern uint8_t mouse_byte[3];
+extern bool mouse_left_pressed;
 
 void mouse_init();
-// void mouse_handler(registers_t* regs);
+void mouse_draw();
