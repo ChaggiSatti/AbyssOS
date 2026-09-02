@@ -809,6 +809,35 @@ The PS/2 Mouse packet's first byte contains the button states. We extracted Bit 
 In the compositor loop, a reverse-iteration (Z-Order) collision detection was implemented. If the user clicks the title bar of a window, it is pulled from its current Z-index, shifted to the end of the rendering array (promoting it to the foreground), and its offset is recorded to allow smooth dragging without snapping to the cursor center.
 
 \newpage
+
+
+\section{Phase 22: The ATA Hard Drive Driver}
+{\small\textit{\textbf{Completed:} September 2, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+Before writing the driver, we must understand the core technologies governing physical hard drives in legacy systems:
+\begin{itemize}
+    \item \textbf{ATA (Advanced Technology Attachment):} The standard physical interface used to connect storage devices (Hard Drives, CD-ROMs) to the PC motherboard.
+    \item \textbf{PIO (Programmed Input/Output):} A data transmission method where the CPU itself must manually execute an instruction (like \texttt{inw} or \texttt{outw}) to transfer every single byte of data between the hardware and RAM. While slower than modern DMA (Direct Memory Access), it is the most reliable baseline for storage drivers.
+    \item \textbf{LBA (Logical Block Addressing):} Instead of addressing data physically by Cylinder, Head, and Sector (CHS), LBA abstracts the drive into a flat array of 512-byte blocks. We use LBA28, which uses a 28-bit address, allowing the OS to access up to 128 GB of storage.
+\end{itemize}
+
+\subsection{The Objective}
+Our objective in this phase was to break free from the read-only constraints of the Initial Ramdisk (Initrd). We needed to:
+\begin{enumerate}
+    \item Generate a virtual 64MB raw image file (\texttt{disk.img}) and attach it to QEMU as the Primary Master drive.
+    \item Implement hardware-accelerated 16-bit port I/O to read and write entire 512-byte sectors.
+    \item Write an ATA PIO driver to permanently etch a message onto the magnetic disk, and verify it via a hexadecimal dump on the host machine.
+\end{enumerate}
+
+\subsection{Implementation \& Bug Resolution}
+Because hard drives process data in 512-byte sectors (256 16-bit words), relying on our standard 8-bit \texttt{inb} port reader would be highly inefficient. We expanded \texttt{io.h} to include the x86 \texttt{rep insw} and \texttt{rep outsw} inline assembly instructions, allowing the CPU to blast 16-bit words directly between the IDE controller and system memory at maximum hardware speeds.
+
+The ATA driver sends the 28-bit LBA sector address across ports \texttt{0x1F3} through \texttt{0x1F6}, and sends the READ (\texttt{0x20}) or WRITE (\texttt{0x30}) command to \texttt{0x1F7}. 
+
+During testing, a critical interrupt conflict was discovered: when the ATA controller finishes a write command, it fires IRQ 14 (Interrupt 46). Since our IDT lacked an \texttt{isr46} handler, the OS crashed immediately after the disk write. Because our driver uses polling (waiting for \texttt{BSY} and \texttt{DRQ} flags rather than using interrupts), we elegantly resolved the crash by setting the \texttt{nIEN} (No Interrupt Enable) bit in the Device Control Register (\texttt{0x3F6}), instructing the hard drive to remain silent after finishing commands. 
+
+\newpage
 \section{Complete Source Code}
 
 \subsection{Makefile}
@@ -894,8 +923,11 @@ kernel/mouse.o: kernel/mouse.cpp
 kernel/ui.o: kernel/ui.cpp
 	$(CC) $(CFLAGS) -c kernel/ui.cpp -o kernel/ui.o
 
-abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o 
-	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o
+kernel/ata.o: kernel/ata.cpp
+	$(CC) $(CFLAGS) -c kernel/ata.cpp -o kernel/ata.o
+
+abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o 
+	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o
 
 abyss.iso: abyss.bin
 	cp abyss.bin iso/boot/abyss.bin
@@ -904,10 +936,10 @@ abyss.iso: abyss.bin
 
 run: abyss.iso
 # 	qemu-system-i386 -cdrom abyss.iso
-	qemu-system-i386 -cdrom abyss.iso -vga std
+	qemu-system-i386 -hda disk.img -cdrom abyss.iso -vga std
 
 clean:
-	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o
+	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o
 
 \end{lstlisting}
 
@@ -1203,6 +1235,84 @@ Greetings from the Abyss' Virtual file system, mortal!!
 
 \end{lstlisting}
 
+\subsection{ata.cpp}
+\begin{lstlisting}[language={C++}]
+#include "ata.h"
+#include "io.h"
+
+#define ATA_DATA        0x1F0
+#define ATA_SECTOR_CNT  0x1F2
+#define ATA_LBA_LOW     0x1F3
+#define ATA_LBA_MID     0x1F4
+#define ATA_LBA_HIGH    0x1F5
+#define ATA_DRIVE       0x1F6
+#define ATA_COMMAND     0x1F7
+#define ATA_STATUS      0x1F7
+
+#define ATA_CMD_READ_PIO  0x20
+#define ATA_CMD_WRITE_PIO 0x30
+
+#define ATA_SR_BSY     0x80    
+#define ATA_SR_DRQ     0x08 
+
+void ata_wait_bsy(){
+    while(inb(ATA_STATUS) & ATA_SR_BSY);
+}
+
+void ata_wait_drq(){
+    while(!(inb(ATA_STATUS) & ATA_SR_DRQ));
+}
+
+void ata_init(){
+    outb(0x3F6, 0x02);
+}
+
+void ata_read_sector(uint32_t lba, uint8_t* buf){
+    ata_wait_bsy();
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_SECTOR_CNT, 1);
+    outb(ATA_LBA_LOW, (uint8_t)lba);
+    outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HIGH, (uint8_t)(lba >> 16));
+
+    outb(ATA_COMMAND, ATA_CMD_READ_PIO);
+    ata_wait_bsy();
+    ata_wait_drq();
+
+    insw(ATA_DATA, buf, 256);
+}
+
+void ata_write_sector(uint32_t lba, uint8_t* buffer) {
+    ata_wait_bsy();
+    
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_SECTOR_CNT, 1);
+    outb(ATA_LBA_LOW, (uint8_t)lba);
+    outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HIGH, (uint8_t)(lba >> 16));
+    
+    outb(ATA_COMMAND, ATA_CMD_WRITE_PIO);
+    
+    ata_wait_bsy();
+    ata_wait_drq();
+    
+    outsw(ATA_DATA, buffer, 256);
+    ata_wait_bsy();
+    outb(ATA_COMMAND, 0xE7); 
+    ata_wait_bsy();
+}
+\end{lstlisting}
+
+\subsection{ata.h}
+\begin{lstlisting}[language={C++}]
+#pragma once 
+#include <stdint.h>
+
+void ata_init();
+void ata_read_sector(uint32_t lba, uint8_t* buf);
+void ata_write_sector(uint32_t lba, uint8_t* buf);
+\end{lstlisting}
+
 \subsection{gdt.cpp}
 \begin{lstlisting}[language={C++}]
 #include "gdt.h"
@@ -1451,6 +1561,15 @@ static inline uint8_t inb(uint16_t port) {
 static inline void io_wait(void) {
     outb(0x80, 0);
 }
+
+static inline void insw(uint16_t port, void* addr, uint32_t count) {
+    asm volatile("cld; rep insw" : "+D"(addr), "+c"(count) : "d"(port) : "memory");
+}
+
+static inline void outsw(uint16_t port, const void* addr, uint32_t count) {
+    asm volatile("cld; rep outsw" : "+S"(addr), "+c"(count) : "d"(port) : "memory");
+}
+
 \end{lstlisting}
 
 \subsection{isr.cpp}
@@ -1613,6 +1732,7 @@ extern "C" void isr33_handler() {
 #include "vesa.h"
 #include "mouse.h"
 #include "ui.h"
+#include "ata.h"
 
 extern "C" void jump_usermode();
 extern "C" void test_user_function(){
@@ -1651,6 +1771,14 @@ extern "C" void kernel_main(multiboot_info* mbd){
     init_tasking();
     vesa_init((uint32_t)mbd->framebuffer_addr, mbd->framebuffer_width, mbd->framebuffer_height, mbd->framebuffer_pitch);
     mouse_init();
+    ata_init();
+    uint8_t disk_buf[512];
+    for(int i = 0; i<512; i++) disk_buf[i] = 0;
+    const char* disk_msg = "The Hard drive is ready mortal!";
+    for(int i = 0; disk_msg[i] != '\0'; i++){
+        disk_buf[i] = disk_msg[i];
+    }
+    ata_write_sector(1, disk_buf);
     vga_clear();
     draw_rect(0, 0, 1024, 768, 0x000000);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);

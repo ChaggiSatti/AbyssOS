@@ -13,6 +13,7 @@
 #include "vesa.h"
 #include "mouse.h"
 #include "ui.h"
+#include "ata.h"
 
 extern "C" void jump_usermode();
 extern "C" void test_user_function(){
@@ -51,6 +52,14 @@ extern "C" void kernel_main(multiboot_info* mbd){
     init_tasking();
     vesa_init((uint32_t)mbd->framebuffer_addr, mbd->framebuffer_width, mbd->framebuffer_height, mbd->framebuffer_pitch);
     mouse_init();
+    ata_init();
+    uint8_t disk_buf[512];
+    for(int i = 0; i<512; i++) disk_buf[i] = 0;
+    const char* disk_msg = "The Hard drive is ready mortal!";
+    for(int i = 0; disk_msg[i] != '\0'; i++){
+        disk_buf[i] = disk_msg[i];
+    }
+    ata_write_sector(1, disk_buf);
     vga_clear();
     draw_rect(0, 0, 1024, 768, 0x000000);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);

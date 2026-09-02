@@ -79,8 +79,11 @@ kernel/mouse.o: kernel/mouse.cpp
 kernel/ui.o: kernel/ui.cpp
 	$(CC) $(CFLAGS) -c kernel/ui.cpp -o kernel/ui.o
 
-abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o 
-	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o
+kernel/ata.o: kernel/ata.cpp
+	$(CC) $(CFLAGS) -c kernel/ata.cpp -o kernel/ata.o
+
+abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o 
+	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o
 
 abyss.iso: abyss.bin
 	cp abyss.bin iso/boot/abyss.bin
@@ -89,7 +92,7 @@ abyss.iso: abyss.bin
 
 run: abyss.iso
 # 	qemu-system-i386 -cdrom abyss.iso
-	qemu-system-i386 -cdrom abyss.iso -vga std
+	qemu-system-i386 -hda disk.img -cdrom abyss.iso -vga std
 
 clean:
-	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o
+	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o
