@@ -14,6 +14,7 @@
 #include "mouse.h"
 #include "ui.h"
 #include "ata.h"
+#include "fat32.h"
 
 extern "C" void jump_usermode();
 extern "C" void test_user_function(){
@@ -62,6 +63,10 @@ extern "C" void kernel_main(multiboot_info* mbd){
     ata_write_sector(1, disk_buf);
     vga_clear();
     draw_rect(0, 0, 1024, 768, 0x000000);
+    fat32_init();
+    fat32_list_root();
+    vesa_swap_buffers();
+    while(1);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
     vga_print("Abyss v1.0 loading...\nLoading Virtual File System...\nFiles loaded...\n...\n...\nHello Mortal...");
     if (mbd->mods_count > 0) {

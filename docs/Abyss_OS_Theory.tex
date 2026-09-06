@@ -838,6 +838,41 @@ The ATA driver sends the 28-bit LBA sector address across ports \texttt{0x1F3} t
 During testing, a critical interrupt conflict was discovered: when the ATA controller finishes a write command, it fires IRQ 14 (Interrupt 46). Since our IDT lacked an \texttt{isr46} handler, the OS crashed immediately after the disk write. Because our driver uses polling (waiting for \texttt{BSY} and \texttt{DRQ} flags rather than using interrupts), we elegantly resolved the crash by setting the \texttt{nIEN} (No Interrupt Enable) bit in the Device Control Register (\texttt{0x3F6}), instructing the hard drive to remain silent after finishing commands. 
 
 \newpage
+
+\section{Phase 23: The FAT32 File System}
+{\small\textit{\textbf{Completed:} September 6, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+Reading raw bytes from a hard drive using LBA sectors is only half the battle. To provide a usable operating system, we must implement a standard File System. We chose \textbf{FAT32} (File Allocation Table 32-bit), originally introduced in Windows 95 OSR2, because it is the most widely supported legacy file system and remains the standard for USB flash drives today.
+
+A FAT32 volume consists of several key regions:
+\begin{itemize}
+    \item \textbf{VBR (Volume Boot Record):} Located at Sector 0 of the partition. It contains crucial metadata about the file system, including the number of sectors per cluster and the location of the Root Directory.
+    \item \textbf{FAT (File Allocation Table):} A massive array of 32-bit integers that act as a linked list. It tracks which clusters belong to which files, allowing files to be fragmented across the physical disk.
+    \item \textbf{Data Region:} The actual sectors where file contents and directories are stored, organized into "Clusters" (blocks of contiguous sectors).
+\end{itemize}
+
+\subsection{The Objective}
+The goal of this phase was to teach Abyss OS to parse the FAT32 VBR and read the Root Directory. We needed to format our virtual \texttt{disk.img} as a FAT32 volume, inject a test file from the Linux host machine, and successfully print the name of that file to the Abyss OS screen.
+
+\subsection{Implementation \& Structure Alignment}
+We utilized the Linux \texttt{mtools} utility (\texttt{mformat} and \texttt{mcopy}) to format \texttt{disk.img} and inject \texttt{HELLO.TXT} without requiring root privileges. 
+
+To parse the VBR, we had to ensure our C++ \texttt{FAT32\_VBR} structure perfectly matched the physical byte layout on the disk. Because C++ compilers often optimize structures by injecting invisible "padding bytes" to align variables to 4-byte memory boundaries, reading 512 raw bytes directly into a standard struct would result in misaligned garbage data. 
+
+To solve this, we used compiler directives to force exact physical byte alignment:
+\begin{lstlisting}[language=C++]
+#pragma pack(push, 1) // Instructs compiler to pack variables tightly (1-byte alignment)
+
+struct FAT32_VBR { ... };
+struct FAT32_DirectoryEntry { ... };
+
+#pragma pack(pop)     // Restores normal compiler alignment optimizations
+\end{lstlisting}
+
+By casting the 512 bytes from Sector 0 into the \texttt{FAT32\_VBR} pointer, the kernel successfully dynamically calculated the LBA of the Root Directory cluster. It then loaded the Root Directory into memory, cast the buffer into an array of 32-byte \texttt{FAT32\_DirectoryEntry} structures, filtered out deleted or hidden files, and successfully rendered the \texttt{HELLO.TXT} filename to the GUI.
+
+\newpage
 \section{Complete Source Code}
 
 \subsection{Makefile}
@@ -926,8 +961,11 @@ kernel/ui.o: kernel/ui.cpp
 kernel/ata.o: kernel/ata.cpp
 	$(CC) $(CFLAGS) -c kernel/ata.cpp -o kernel/ata.o
 
-abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o 
-	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o
+kernel/fat32.o: kernel/fat32.cpp
+	$(CC) $(CFLAGS) -c kernel/fat32.cpp -o kernel/fat32.o 
+
+abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o kernel/fat32.o
+	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o kernel/fat32.o
 
 abyss.iso: abyss.bin
 	cp abyss.bin iso/boot/abyss.bin
@@ -936,10 +974,10 @@ abyss.iso: abyss.bin
 
 run: abyss.iso
 # 	qemu-system-i386 -cdrom abyss.iso
-	qemu-system-i386 -hda disk.img -cdrom abyss.iso -vga std
+	qemu-system-i386 -hda disk.img -cdrom abyss.iso -boot d -vga std
 
 clean:
-	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o
+	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o kernel/fat32.o
 
 \end{lstlisting}
 
@@ -1311,6 +1349,147 @@ void ata_write_sector(uint32_t lba, uint8_t* buffer) {
 void ata_init();
 void ata_read_sector(uint32_t lba, uint8_t* buf);
 void ata_write_sector(uint32_t lba, uint8_t* buf);
+\end{lstlisting}
+
+\subsection{fat32.cpp}
+\begin{lstlisting}[language={C++}]
+#include "fat32.h"
+#include "ata.h"
+#include "vga.h"
+
+uint32_t fat_start_sector = 0;
+uint32_t data_start_sector = 0;
+uint32_t root_dir_cluster = 0;
+uint8_t  sectors_per_cluster = 0;
+
+// Converts a FAT32 Cluster Number into a physical ATA LBA Sector Number
+uint32_t cluster_to_lba(uint32_t cluster) {
+    return data_start_sector + ((cluster - 2) * sectors_per_cluster);
+}
+
+void fat32_init() {
+    uint8_t boot_sector[512];
+    ata_read_sector(0, boot_sector); // Read LBA 0
+    
+    FAT32_VBR* vbr = (FAT32_VBR*)boot_sector;
+    
+    // Check if it's actually FAT32
+    if (vbr->boot_signature != 0xAA55) {
+        vga_print("Error: Disk is not FAT32 formatted!\n");
+        return;
+    }
+    
+    sectors_per_cluster = vbr->sectors_per_cluster;
+    root_dir_cluster = vbr->root_cluster;
+    
+    // Calculate memory regions
+    fat_start_sector = vbr->reserved_sectors;
+    uint32_t fat_size = vbr->sectors_per_fat_32;
+    data_start_sector = fat_start_sector + (vbr->fat_count * fat_size);
+    
+    vga_print("FAT32 Init Success! Sys ID: ");
+    for(int i=0; i<8; i++) vga_print_char(vbr->sys_identifier[i]);
+    vga_print("\n");
+}
+
+void fat32_list_root() {
+    uint8_t root_buffer[512];
+    uint32_t root_lba = cluster_to_lba(root_dir_cluster);
+    
+    // Read the first sector of the root directory
+    ata_read_sector(root_lba, root_buffer);
+    
+    FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)root_buffer;
+    
+    // A 512-byte sector holds exactly sixteen 32-byte directory entries (512 / 32 = 16)
+    for (int i = 0; i < 16; i++) {
+        FAT32_DirectoryEntry* entry = &entries[i];
+        
+        // 0x00 means the rest of the directory is empty
+        if (entry->name[0] == 0x00) break;
+        
+        // 0xE5 means the file was deleted, skip it
+        if ((unsigned char)entry->name[0] == 0xE5) continue;
+        
+        // Skip hidden files, system files, and long-filename entries (0x0F)
+        if (entry->attributes == 0x0F || (entry->attributes & 0x02) || (entry->attributes & 0x04)) continue;
+        
+        // Print the short filename!
+        vga_print("Found File: ");
+        for(int j=0; j<8; j++) if(entry->name[j] != ' ') vga_print_char(entry->name[j]);
+        vga_print_char('.');
+        for(int j=0; j<3; j++) if(entry->ext[j] != ' ') vga_print_char(entry->ext[j]);
+        vga_print("\n");
+    }
+}
+
+\end{lstlisting}
+
+\subsection{fat32.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+// Packed ensures the compiler doesn't add padding between variables!
+// #pragma pack(push, 1)
+
+// The FAT32 Volume Boot Record (VBR) located at Sector 0
+struct FAT32_VBR {
+    uint8_t  jump[3];
+    char     oem_name[8];
+    uint16_t bytes_per_sector;      // Usually 512
+    uint8_t  sectors_per_cluster;
+    uint16_t reserved_sectors;      // Boot record sectors before the FAT
+    uint8_t  fat_count;             // Number of FATs (usually 2)
+    uint16_t dir_entries;           // Unused in FAT32 (0)
+    uint16_t total_sectors_16;      // Unused in FAT32 (0)
+    uint8_t  media_descriptor;
+    uint16_t sectors_per_fat_16;    // Unused in FAT32 (0)
+    uint16_t sectors_per_track;
+    uint16_t heads;
+    uint32_t hidden_sectors;
+    uint32_t total_sectors_32;      // Total sectors in volume
+    
+    // FAT32 Extended Boot Record
+    uint32_t sectors_per_fat_32;    // Size of the FAT in sectors
+    uint16_t flags;
+    uint16_t fat_version;
+    uint32_t root_cluster;          // Usually cluster 2
+    uint16_t fsinfo_cluster;
+    uint16_t backup_boot_sector;
+    uint8_t  reserved[12];
+    uint8_t  drive_number;
+    uint8_t  nt_flags;
+    uint8_t  signature;             // 0x28 or 0x29
+    uint32_t serial_number;
+    char     label[11];
+    char     sys_identifier[8];     // "FAT32   "
+    uint8_t  boot_code[420];
+    uint16_t boot_signature;        // 0xAA55
+}__attribute__((packed));
+
+// A 32-byte FAT32 Directory Entry
+struct FAT32_DirectoryEntry {
+    char     name[8];               // Short filename (e.g., "HELLO   ")
+    char     ext[3];                // Extension (e.g., "TXT")
+    uint8_t  attributes;            // File, Directory, Hidden, Read-Only, etc.
+    uint8_t  reserved;
+    uint8_t  creation_time_tenths;
+    uint16_t creation_time;
+    uint16_t creation_date;
+    uint16_t access_date;
+    uint16_t first_cluster_high;    // High 16 bits of the data cluster
+    uint16_t modify_time;
+    uint16_t modify_date;
+    uint16_t first_cluster_low;     // Low 16 bits of the data cluster
+    uint32_t size;                  // File size in bytes
+}__attribute__((packed));
+
+// #pragma pack(pop)
+
+void fat32_init();
+void fat32_list_root();
+
 \end{lstlisting}
 
 \subsection{gdt.cpp}
@@ -1733,6 +1912,7 @@ extern "C" void isr33_handler() {
 #include "mouse.h"
 #include "ui.h"
 #include "ata.h"
+#include "fat32.h"
 
 extern "C" void jump_usermode();
 extern "C" void test_user_function(){
@@ -1781,6 +1961,10 @@ extern "C" void kernel_main(multiboot_info* mbd){
     ata_write_sector(1, disk_buf);
     vga_clear();
     draw_rect(0, 0, 1024, 768, 0x000000);
+    fat32_init();
+    fat32_list_root();
+    vesa_swap_buffers();
+    while(1);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
     vga_print("Abyss v1.0 loading...\nLoading Virtual File System...\nFiles loaded...\n...\n...\nHello Mortal...");
     if (mbd->mods_count > 0) {
