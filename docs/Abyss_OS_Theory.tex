@@ -873,6 +873,30 @@ struct FAT32_DirectoryEntry { ... };
 By casting the 512 bytes from Sector 0 into the \texttt{FAT32\_VBR} pointer, the kernel successfully dynamically calculated the LBA of the Root Directory cluster. It then loaded the Root Directory into memory, cast the buffer into an array of 32-byte \texttt{FAT32\_DirectoryEntry} structures, filtered out deleted or hidden files, and successfully rendered the \texttt{HELLO.TXT} filename to the GUI.
 
 \newpage
+
+\section{Phase 24: Reading FAT32 Clusters}
+{\small\textit{\textbf{Completed:} September 20, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+In Phase 23, we parsed the Root Directory and found the 32-byte metadata entry for \texttt{HELLO.TXT}. However, a FAT32 directory entry only stores the \textit{starting cluster} of a file. It does not tell you where the rest of the file is located! 
+
+Because operating systems constantly create, delete, and resize files, files are rarely stored in contiguous blocks on the hard drive. Instead, they are fragmented. To reconstruct a fragmented file, FAT32 uses the \textbf{File Allocation Table (FAT)}. The FAT is a massive array of 32-bit integers that acts as a linked list mapping out the physical disk.
+
+\subsection{The Objective}
+The goal of this phase was to write a cluster traversal algorithm that could query the FAT table, follow a file's linked list chain across the physical disk, extract the raw data sectors into RAM, and reconstruct the complete \texttt{HELLO.TXT} string inside the Abyss OS environment.
+
+\subsection{Implementation: Traversing the Chain}
+Because the FAT table itself is stored on the hard drive, looking up a cluster requires a disk read. We implemented \texttt{fat32\_get\_next\_cluster(current\_cluster)}, which performs the following calculations:
+\begin{enumerate}
+    \item \textbf{Sector Offset:} Since 1 sector is 512 bytes, and each FAT entry is 4 bytes (32-bit), there are exactly 128 entries per sector. We divide the cluster ID by 128 to find which physical sector of the FAT table to read.
+    \item \textbf{Byte Offset:} We take the cluster ID modulo 128 and multiply by 4 to find the exact byte offset of the entry inside that sector.
+\end{enumerate}
+
+After reading the FAT sector via the ATA driver, the 32-bit integer is extracted. Because FAT32 only uses 28 bits, the top 4 bits are masked out (\texttt{0x0FFFFFFF}). This value is the next cluster in the file's chain. A value of \texttt{0x0FFFFFF8} or higher signifies the End-of-File (EOF).
+
+We successfully integrated this logic into \texttt{fat32\_read\_file}, which allocates a buffer, reads the data clusters, and dynamically follows the FAT chain until EOF is reached. Our testing proved flawless: Abyss OS allocated 2KB of RAM, read the fragmented clusters, and rendered the internal text of \texttt{HELLO.TXT} directly to the GUI!
+
+\newpage
 \section{Complete Source Code}
 
 \subsection{Makefile}
@@ -1366,6 +1390,12 @@ uint8_t  sectors_per_cluster = 0;
 uint32_t cluster_to_lba(uint32_t cluster) {
     return data_start_sector + ((cluster - 2) * sectors_per_cluster);
 }
+bool str_match(const char* str1, const char* str2, int len) {
+    for (int i = 0; i < len; i++) {
+        if (str1[i] != str2[i]) return false;
+    }
+    return true;
+}
 
 void fat32_init() {
     uint8_t boot_sector[512];
@@ -1421,6 +1451,70 @@ void fat32_list_root() {
         for(int j=0; j<3; j++) if(entry->ext[j] != ' ') vga_print_char(entry->ext[j]);
         vga_print("\n");
     }
+}
+uint32_t fat32_get_next_cluster(uint32_t current_cluster) {
+    // 1 Sector = 512 Bytes. Each FAT entry is 4 Bytes (32 bits). 
+    // Therefore, there are exactly 128 FAT entries per sector!
+    uint32_t fat_sector = fat_start_sector + (current_cluster / 128);
+    uint32_t fat_offset = (current_cluster % 128) * 4;
+    
+    uint8_t sector_buffer[512];
+    ata_read_sector(fat_sector, sector_buffer);
+    
+    // Read the 32-bit FAT entry
+    uint32_t next_cluster = *((uint32_t*)&sector_buffer[fat_offset]);
+    
+    // Mask out the top 4 bits (since it's FAT32, only 28 bits are used)
+    return next_cluster & 0x0FFFFFFF; 
+}
+
+bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* out_buffer) {
+    uint8_t root_buffer[512];
+    uint32_t root_lba = cluster_to_lba(root_dir_cluster);
+    ata_read_sector(root_lba, root_buffer);
+    
+    FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)root_buffer;
+    uint32_t file_cluster = 0;
+    
+    // 1. Search the Root Directory for the file
+    for (int i = 0; i < 16; i++) {
+        FAT32_DirectoryEntry* entry = &entries[i];
+        if (entry->name[0] == 0x00) break;
+        if ((unsigned char)entry->name[0] == 0xE5) continue;
+        if (entry->attributes == 0x0F || (entry->attributes & 0x08)) continue;
+        
+        // We use strict 8.3 FAT32 string matching
+        if (str_match(entry->name, target_name, 8) && str_match(entry->ext, target_ext, 3)) {
+            // Found it! Combine the high and low 16-bit halves to get the 32-bit starting cluster
+            file_cluster = ((uint32_t)entry->first_cluster_high << 16) | entry->first_cluster_low;
+            break;
+        }
+    }
+    
+    if (file_cluster == 0) {
+        vga_print("Error: File not found!\n");
+        return false;
+    }
+    
+    // 2. Read the file, cluster by cluster
+    uint32_t current_cluster = file_cluster;
+    int buffer_offset = 0;
+    
+    // A cluster value of 0x0FFFFFF8 or higher means "End of File"
+    while (current_cluster < 0x0FFFFFF8) { 
+        uint32_t lba = cluster_to_lba(current_cluster);
+        
+        // Read all sectors in this cluster (mtools formats use 1 sector per cluster for tiny disks)
+        for (int i = 0; i < sectors_per_cluster; i++) {
+            ata_read_sector(lba + i, &out_buffer[buffer_offset]);
+            buffer_offset += 512;
+        }
+        
+        // Find the next cluster from the FAT table
+        current_cluster = fat32_get_next_cluster(current_cluster);
+    }
+    
+    return true;
 }
 
 \end{lstlisting}
@@ -1489,6 +1583,8 @@ struct FAT32_DirectoryEntry {
 
 void fat32_init();
 void fat32_list_root();
+bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* out_buffer);
+
 
 \end{lstlisting}
 
@@ -1962,7 +2058,14 @@ extern "C" void kernel_main(multiboot_info* mbd){
     vga_clear();
     draw_rect(0, 0, 1024, 768, 0x000000);
     fat32_init();
-    fat32_list_root();
+    // fat32_list_root();
+    uint8_t file_buffer[2048];
+    for(int i = 0; i<2048; i++) file_buffer[i] = 0;
+    if (fat32_read_file("HELLO   ", "TXT", file_buffer)) {
+        vga_print("\nRead from physical Hard Drive:\n> ");
+        vga_print((const char*)file_buffer);
+        vga_print("\n");
+    }
     vesa_swap_buffers();
     while(1);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);

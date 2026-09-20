@@ -60,3 +60,5 @@ struct FAT32_DirectoryEntry {
 
 void fat32_init();
 void fat32_list_root();
+bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* out_buffer);
+

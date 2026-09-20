@@ -64,7 +64,14 @@ extern "C" void kernel_main(multiboot_info* mbd){
     vga_clear();
     draw_rect(0, 0, 1024, 768, 0x000000);
     fat32_init();
-    fat32_list_root();
+    // fat32_list_root();
+    uint8_t file_buffer[2048];
+    for(int i = 0; i<2048; i++) file_buffer[i] = 0;
+    if (fat32_read_file("HELLO   ", "TXT", file_buffer)) {
+        vga_print("\nRead from physical Hard Drive:\n> ");
+        vga_print((const char*)file_buffer);
+        vga_print("\n");
+    }
     vesa_swap_buffers();
     while(1);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
