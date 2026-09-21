@@ -5,6 +5,7 @@ struct Window {
     int x, y;
     int width, height;
     const char* title;
+    bool visible;
     
     // State for dragging
     bool is_dragged;

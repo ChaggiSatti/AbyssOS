@@ -23,4 +23,7 @@ code kernel/vesa.cpp
 code kernel/mouse.h
 code kernel/mouse.cpp
 code kernel/io.h
-
+code kernel/fat32.h
+code kernel/fat32.cpp
+code kernel/ui.h
+code kernel/ui.cpp

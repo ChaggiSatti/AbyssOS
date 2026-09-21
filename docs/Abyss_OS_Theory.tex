@@ -897,6 +897,29 @@ After reading the FAT sector via the ATA driver, the 32-bit integer is extracted
 We successfully integrated this logic into \texttt{fat32\_read\_file}, which allocates a buffer, reads the data clusters, and dynamically follows the FAT chain until EOF is reached. Our testing proved flawless: Abyss OS allocated 2KB of RAM, read the fragmented clusters, and rendered the internal text of \texttt{HELLO.TXT} directly to the GUI!
 
 \newpage
+
+\section{Phase 25: The Graphical File Explorer}
+{\small\textit{\textbf{Completed:} September 20, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+In modern operating systems, the file system backend and the graphical user interface (GUI) frontend are completely separate subsystems. The GUI relies on a robust API to query the file system for directory entries and data. Up until this point, Abyss OS had only tested the FAT32 driver by printing text directly to the screen via a blocking \texttt{while(1)} loop.
+
+\subsection{The Objective}
+The goal of this phase was to construct Abyss OS's first native, data-driven graphical application. We needed to integrate the FAT32 driver directly into the window manager, allowing a "File Explorer" window to dynamically query the hard drive and render its contents as graphical elements on the screen.
+
+\subsection{Implementation: Building the App}
+To decouple the backend from the frontend, we introduced a new API function in \texttt{kernel/fat32.cpp}: \texttt{fat32\_get\_root\_entries()}. This function queries the FAT32 root directory on the physical disk and populates an array of \texttt{FAT32\_DirectoryEntry} structures, abstracting away the low-level ATA sector reads from the GUI.
+
+In the window manager (\texttt{kernel/ui.cpp}), we expanded our global \texttt{windows} array to include a third application: "File Explorer". During the primary \texttt{ui\_render()} loop, if the renderer detects it is drawing the File Explorer window, it executes custom application logic:
+\begin{enumerate}
+    \item It clears the interior of the window with a solid white background.
+    \item It calls the \texttt{fat32\_get\_root\_entries()} API to fetch the current files from the hard drive.
+    \item It loops through each returned file, utilizing our primitive graphics functions to draw a blue icon (\texttt{draw\_rect}) and render the 8.3 filename (\texttt{draw\_string}) directly into the application's coordinate space.
+\end{enumerate}
+
+This successfully demonstrated a true OS architecture: a hardware driver providing abstracted data to a high-level graphical window manager!
+
+\newpage
 \section{Complete Source Code}
 
 \subsection{Makefile}
@@ -1516,6 +1539,28 @@ bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* o
     
     return true;
 }
+int fat32_get_root_entries(FAT32_DirectoryEntry* out_buffer, int max_entries) {
+    uint8_t root_buffer[512];
+    uint32_t root_lba = cluster_to_lba(root_dir_cluster);
+    ata_read_sector(root_lba, root_buffer);
+    
+    FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)root_buffer;
+    int found_count = 0;
+    
+    for (int i = 0; i < 16; i++) {
+        FAT32_DirectoryEntry* entry = &entries[i];
+        if (entry->name[0] == 0x00) break;
+        if ((unsigned char)entry->name[0] == 0xE5) continue;
+        if (entry->attributes == 0x0F || (entry->attributes & 0x08)) continue;
+        
+        if (found_count < max_entries) {
+            out_buffer[found_count] = *entry;
+            found_count++;
+        }
+    }
+    
+    return found_count;
+}
 
 \end{lstlisting}
 
@@ -1584,6 +1629,8 @@ struct FAT32_DirectoryEntry {
 void fat32_init();
 void fat32_list_root();
 bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* out_buffer);
+int fat32_get_root_entries(FAT32_DirectoryEntry* out_buffer, int max_entries);
+
 
 
 \end{lstlisting}
@@ -2059,15 +2106,20 @@ extern "C" void kernel_main(multiboot_info* mbd){
     draw_rect(0, 0, 1024, 768, 0x000000);
     fat32_init();
     // fat32_list_root();
-    uint8_t file_buffer[2048];
-    for(int i = 0; i<2048; i++) file_buffer[i] = 0;
-    if (fat32_read_file("HELLO   ", "TXT", file_buffer)) {
-        vga_print("\nRead from physical Hard Drive:\n> ");
-        vga_print((const char*)file_buffer);
-        vga_print("\n");
+
+    // uint8_t file_buffer[2048];
+    // for(int i = 0; i<2048; i++) file_buffer[i] = 0;
+    // if (fat32_read_file("HELLO   ", "TXT", file_buffer)) {
+    //     vga_print("\nRead from physical Hard Drive:\n> ");
+    //     vga_print((const char*)file_buffer);
+    //     vga_print("\n");
+    // }
+
+    // vesa_swap_buffers();
+    while(1){
+        ui_render();
+        vesa_swap_buffers();
     }
-    vesa_swap_buffers();
-    while(1);
     // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
     vga_print("Abyss v1.0 loading...\nLoading Virtual File System...\nFiles loaded...\n...\n...\nHello Mortal...");
     if (mbd->mods_count > 0) {
@@ -2687,14 +2739,18 @@ void tss_init(uint32_t kernel_stack);
 #include "ui.h"
 #include "vesa.h"
 #include "mouse.h"
+#include "fat32.h"
 
 bool needs_redraw = true; // Always draw the very first frame
 
-Window windows[2] = {
+Window windows[3] = {
     {100, 100, 400, 300, "Abyss OS Settings", false, 0, 0},
-    {550, 250, 400, 200, "System Monitor", false, 0, 0}
+    {550, 250, 400, 200, "System Monitor", false, 0, 0},
+    {200, 150, 350, 250, "File Explorer", false, 0, 0}
 };
-int num_windows = 2;
+int num_windows = 3;
+
+// int num_windows = 2;
 
 void draw_window(uint32_t x, uint32_t y, uint32_t width, uint32_t height, const char* title) {
     // Window Body
@@ -2785,7 +2841,30 @@ void ui_render() {
     
     // 2. Draw Windows from our array
     for (int i = 0; i < num_windows; i++) {
-        draw_window(windows[i].x, windows[i].y, windows[i].width, windows[i].height, windows[i].title);
+        Window* w = &windows[i];
+        draw_window(w->x, w->y, w->width, w->height, w->title);
+        if(w->title[0] == 'F' and w->title[1] == 'i'){
+            draw_rect(w->x + 2, w->y + 24, w->width - 4, w->height - 26, 0xFFFFFF);
+            FAT32_DirectoryEntry files[16];
+            int file_count = fat32_get_root_entries(files, 16);
+            int file_y = w->y + 30;
+            for (int f = 0; f < file_count; f++) {
+                draw_rect(w->x + 10, file_y, 16, 16, 0x0055AA);
+                
+                // Construct the filename string (8 chars name + '.' + 3 chars ext)
+                char filename[13];
+                int idx = 0;
+                for(int j=0; j<8; j++) if(files[f].name[j] != ' ') filename[idx++] = files[f].name[j];
+                filename[idx++] = '.';
+                for(int j=0; j<3; j++) if(files[f].ext[j] != ' ') filename[idx++] = files[f].ext[j];
+                filename[idx] = '\0';
+                
+                // Draw the text in black
+                draw_string(filename, w->x + 35, file_y + 4, 0x000000, 0xFFFFFF, 1);
+                
+                file_y += 24;
+            }
+        }
     }
     // 3. Draw Mouse
     mouse_draw();
@@ -3222,5 +3301,18 @@ SECTIONS{
     .bss : { *(COMMON) *(.bss) }
 }
 \end{lstlisting}
+
+
+\section{Phase 26: Interactive File Reading}
+In Phase 26, we transformed the static GUI into an interactive File Explorer. 
+
+\subsection{Root Directory Chain Traversal}
+Initially, the FAT32 driver only read the first sector of the Root Directory, limiting the system to 16 file entries (or fewer if Long File Names were present). This was resolved by implementing a standard FAT cluster chain traversal using a \texttt{while} loop that continuously queried the File Allocation Table for the next cluster until the EOF marker (\texttt{0x0FFFFFF8}) was reached. This allowed the system to parse massively fragmented and heavily populated root directories across multiple physical disk sectors.
+
+\subsection{Interactive GUI Integration}
+We integrated mouse state tracking (comparing current vs. previous frame \texttt{mouse\_left\_pressed} states) to detect localized clicks within the \texttt{ui\_render} File Explorer bounds. Upon detecting a collision between the mouse cursor and a file's bounding box, the GUI triggered a physical ATA sector read from the virtual \texttt{disk.img} into a shared static memory buffer. 
+
+\subsection{The Notepad Application}
+A rudimentary Window Manager visibility system was implemented by adding a boolean \texttt{visible} flag to the core \texttt{Window} structure. When a file was clicked, the hidden Notepad window was toggled to visible and popped to the front of the rendering stack. The Notepad application successfully read the shared memory buffer and utilized the existing \texttt{draw\_string} routine to rasterize the physical file contents directly onto the graphical desktop.
 
 \end{document}

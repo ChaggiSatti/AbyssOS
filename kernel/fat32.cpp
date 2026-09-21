@@ -137,3 +137,36 @@ bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* o
     
     return true;
 }
+int fat32_get_root_entries(FAT32_DirectoryEntry* out_buffer, int max_entries) {
+    uint32_t current_cluster = root_dir_cluster;
+    int found_count = 0;
+    
+    // Traverse the FAT linked list just like we do for regular files!
+    while (current_cluster < 0x0FFFFFF8) {
+        uint32_t lba = cluster_to_lba(current_cluster);
+        
+        // Read all sectors in this cluster
+        for (int s = 0; s < sectors_per_cluster; s++) {
+            uint8_t sector_buffer[512];
+            ata_read_sector(lba + s, sector_buffer);
+            
+            FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)sector_buffer;
+            
+            for (int i = 0; i < 16; i++) {
+                FAT32_DirectoryEntry* entry = &entries[i];
+                if (entry->name[0] == 0x00) return found_count; // End of directory!
+                if ((unsigned char)entry->name[0] == 0xE5) continue; // Deleted
+                if (entry->attributes == 0x0F || (entry->attributes & 0x08)) continue; 
+                
+                if (found_count < max_entries) {
+                    out_buffer[found_count] = *entry;
+                    found_count++;
+                }
+            }
+        }
+        
+        // Ask the FAT table for the next cluster in the directory!
+        current_cluster = fat32_get_next_cluster(current_cluster);
+    }
+    return found_count;
+}
