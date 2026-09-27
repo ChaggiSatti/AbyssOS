@@ -2,6 +2,7 @@
 #include "vesa.h"
 #include "mouse.h"
 #include "fat32.h"
+#include "loader.h"
 
 bool needs_redraw = true; // Always draw the very first frame
 
@@ -12,6 +13,7 @@ Window windows[4] = {
     {300, 200, 400, 300, "Notepad", false, false, 0, 0}
 };
 int num_windows = 4;
+char notepad_text[2048];
 
 
 // int num_windows = 2;
@@ -128,8 +130,7 @@ void ui_render() {
         
         // --- CUSTOM APP RENDERING ---
         
-        // Shared buffer for our apps!
-        static char notepad_text[2048];
+        // Shared buffer for our apps! (Moved to global scope)
         
         // Is this the File Explorer window?
         if (w->title[0] == 'F' && w->title[1] == 'i') { 
@@ -143,7 +144,8 @@ void ui_render() {
             
             int file_y = w->y + 30;
             for (int f = 0; f < file_count; f++) {
-                draw_rect(w->x + 10, file_y, 16, 16, 0x0055AA);
+                bool is_bin = (files[f].ext[0]=='B' && files[f].ext[1]=='I' && files[f].ext[2]=='N');
+                draw_rect(w->x + 10, file_y, 16, 16, is_bin ? 0x00AA00 : 0x0055AA);
                 
                 char filename[13];
                 int idx = 0;
@@ -159,7 +161,6 @@ void ui_render() {
                     if (mouse_x >= w->x + 10 && mouse_x <= w->x + 300 &&
                         mouse_y >= file_y && mouse_y <= file_y + 24) {
                         
-                        for(int clr=0; clr<2048; clr++) notepad_text[clr] = 0;
                         
                         char search_name[9]; char search_ext[4];
                         for(int j=0; j<8; j++) search_name[j] = files[f].name[j];
@@ -167,13 +168,19 @@ void ui_render() {
                         for(int j=0; j<3; j++) search_ext[j] = files[f].ext[j];
                         search_ext[3] = '\0';
                         
-                        fat32_read_file(search_name, search_ext, (uint8_t*)notepad_text);
-                        
-                        for(int win=0; win<num_windows; win++) {
-                            if (windows[win].title[0] == 'N') windows[win].visible = true;
+                        if(search_ext[0] == 'B' and search_ext[1] == 'I' and search_ext[2] == 'N'){
+                            static uint8_t prog_buf[65536];
+                            fat32_read_file(search_name, search_ext, prog_buf);
+                            load_and_run(prog_buf, 65536);
+                            needs_redraw = true;
+                        }else{
+                            for(int clr=0; clr<2048; clr++) notepad_text[clr] = 0;
+                            fat32_read_file(search_name, search_ext, (uint8_t*)notepad_text);
+                            for(int win=0; win<num_windows; win++) {
+                                if (windows[win].title[0] == 'N') windows[win].visible = true;
+                            }
+                            needs_redraw = true;
                         }
-                        
-                        needs_redraw = true;
                     }
                 }
                 

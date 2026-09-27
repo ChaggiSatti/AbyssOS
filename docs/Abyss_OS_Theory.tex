@@ -1,4 +1,4 @@
-\documentclass[12pt,a4paper]{article}
+\documentclass[12pt,a4paper]{report}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
@@ -7,6 +7,15 @@
 \usepackage{hyperref}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{booktabs}
+\usepackage{array}
+
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{20pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{50pt}{40pt}
 
 \lstset{
   basicstyle=\ttfamily\footnotesize,
@@ -18,7 +27,14 @@
   stringstyle=\color{red}
 }
 
-\title{\textbf{Abyss OS: Complete Architecture and Theory Guide}}
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Abyss OS Theory Guide}
+\lhead{\leftmark}
+\rfoot{Page \thepage}
+
+\title{\textbf{Abyss OS: Complete Architecture and Theory Guide}\\[1em]
+\large A Deep-Dive into Bare-Metal x86 Operating System Design}
 \author{Built by After-Dark \& Antigravity}
 \date{\today}
 
@@ -27,608 +43,1254 @@
 \tableofcontents
 \newpage
 
-\section{Phase 0: The Toolchain (The Prerequisites)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Problem with Compilers}
-When you write C++ code and compile it on a Linux machine using \texttt{g++}, the compiler assumes two things:
-\begin{enumerate}
-    \item You are building a program for Linux (it automatically links against \texttt{glibc}, the Linux standard library).
-    \item You want to use the host OS's startup code (like \texttt{crt0}), which sets up command-line arguments and environment variables before calling \texttt{main()}.
-\end{enumerate}
-If we try to run a Linux-compiled binary directly on bare metal without an OS underneath it, the CPU will immediately crash because none of those libraries, OS system calls, or startup routines exist. 
+\chapter{Toolchain \& Build System}
 
-\subsection{Building the Cross-Compiler}
-To solve this, we had to build our own compiler from scratch---a compiler that runs on Linux, but targets "bare-metal x86" (the \texttt{i686-elf} target). We downloaded the raw source code for two massive open-source projects:
+\section{The Cross-Compilation Problem}
+
+When you compile a C++ program on a standard Linux machine, the compiler performs
+a series of hidden assumptions. It links against \texttt{glibc} (the GNU C standard
+library), injects startup code from \texttt{crt0.o} that initializes the C runtime
+environment, and produces an ELF binary that depends on a Linux kernel being present
+to load and execute it.
+
+None of these assumptions hold for a bare-metal kernel. There is no Linux beneath us,
+no \texttt{glibc} to link against, and no OS loader to parse the ELF binary. If we
+attempted to run a standard Linux-compiled binary directly on bare hardware, the CPU
+would execute the startup code, attempt a system call to the kernel to set up memory
+regions, receive no response, and immediately generate a General Protection Fault.
+
+The solution is a \textbf{cross-compiler}: a compiler that \textit{runs} on the host
+machine (Linux x86-64) but \textit{targets} a completely different, standalone
+environment (\texttt{i686-elf}). The \texttt{elf} in the target triple means the
+output format is ELF32, but with no OS ABI, no linked libraries, and no startup
+overhead whatsoever.
+
+We compiled GCC and GNU Binutils from source with the following critical flags:
 \begin{itemize}
-    \item \textbf{GNU Binutils:} The tools that handle assembly code and linking (\texttt{as}, \texttt{ld}).
-    \item \textbf{GCC (GNU Compiler Collection):} The tool that turns our C++ code into assembly (\texttt{gcc}, \texttt{g++}).
-\end{itemize}
-We configured them with flags like \texttt{--disable-nls} (no native language support), \texttt{--without-headers} (no standard C library headers), and \texttt{--target=i686-elf}. Once compiled, we placed them in \texttt{\textasciitilde/opt/cross/bin}. This gave us \texttt{i686-elf-g++}, a compiler that generates pure, standalone x86 machine code completely independent of Linux.
-
-\subsection{Other Dependencies}
-We also installed \textbf{NASM} (The Netwide Assembler) to write our bootloader and low-level routines, \textbf{QEMU} as our virtual machine emulator to test the OS without constantly restarting our physical PC, and \textbf{GRUB / mtools / xorriso} to package our compiled binary into a bootable ISO file.
-
-\section{Phase 0.5: The Build System (Makefile)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Compiler Flags}
-In our Makefile, we compile our C++ code using a very specific set of flags:
-\begin{lstlisting}[language=bash]
-i686-elf-g++ -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti -c file.cpp -o file.o
-\end{lstlisting}
-Here is why every single flag is critical for bare-metal OS development:
-\begin{itemize}
-    \item \textbf{\texttt{-ffreestanding}} \& \textbf{\texttt{-nostdlib}}: Tells the compiler that the standard C/C++ library (\texttt{libc}, \texttt{<iostream>}, \texttt{<string>}) does not exist. The OS must run entirely independently without any pre-built operating system features.
-    \item \textbf{\texttt{-fno-exceptions}} \& \textbf{\texttt{-fno-rtti}}: C++ features like \texttt{try/catch} blocks and Run-Time Type Information (RTTI) require massive runtime support libraries behind the scenes. Because we don't have those libraries, we must strictly disable these C++ features to prevent the compiler from generating calls to non-existent code.
-    \item \textbf{\texttt{-O2}}: Optimizes the generated machine code for speed.
-    \item \textbf{\texttt{-Wall -Wextra}}: Enables strict warnings to catch subtle bugs.
+    \item \textbf{\texttt{--target=i686-elf}}: Targets a 32-bit x86 bare-metal environment.
+    \item \textbf{\texttt{--without-headers}}: Prevents GCC from using any OS header files.
+    \item \textbf{\texttt{--disable-nls}}: Removes internationalization support (unnecessary overhead).
 \end{itemize}
 
-\subsection{NASM and QEMU}
+\section{Compiler Flags for Bare-Metal}
+
+The flags passed to \texttt{i686-elf-g++} enforce the strict discipline of
+bare-metal programming:
+
 \begin{itemize}
-    \item \textbf{NASM:} We use the Netwide Assembler to compile our low-level \texttt{.asm} files into ELF32 object files (\texttt{nasm -f elf32}). Assembly is required for tasks C++ physically cannot perform, like explicitly configuring CPU registers to load the GDT or trigger User Mode.
-    \item \textbf{QEMU:} We use \texttt{qemu-system-i386} as our virtual machine. Instead of flashing our OS to a USB drive and rebooting a physical computer every time we write code, QEMU safely emulates a 32-bit x86 processor directly on top of Linux.
+    \item \textbf{\texttt{-ffreestanding}}: Informs the compiler that the standard
+    library does not exist. It will not generate implicit calls to library functions,
+    even for seemingly simple operations like zero-initializing a large array.
+    \item \textbf{\texttt{-fno-exceptions}}: C++ exception handling (\texttt{try/catch})
+    requires the compiler to generate \textit{unwind tables} and link against the
+    \texttt{libgcc\_eh} library for stack unwinding. Since our kernel lacks that library,
+    we disable this feature entirely.
+    \item \textbf{\texttt{-fno-rtti}}: Run-Time Type Information (the mechanism behind
+    \texttt{dynamic\_cast} and \texttt{typeid}) requires a hidden table of type metadata
+    to be embedded in the binary and queried at runtime. This is unnecessary overhead
+    for a kernel and is disabled.
+    \item \textbf{\texttt{-O2}}: Instructs the compiler to apply a standard suite of
+    optimizations --- loop unrolling, constant folding, dead-code elimination ---
+    to produce faster machine code without making debugging prohibitively difficult.
 \end{itemize}
 
-\section{Phase 1: The Foundation \& Booting}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Multiboot Standard (\texttt{boot.asm})}
-When a PC turns on, the motherboard's BIOS loads a bootloader from the hard drive. Writing a bootloader from absolute scratch that interfaces with the ancient 16-bit BIOS and switches the CPU into 32-bit Protected Mode is incredibly tedious. Instead, we use \textbf{GRUB}. GRUB requires our kernel to comply with the \textbf{Multiboot Specification}. 
+\section{The Build System and Linker Script}
 
-In \texttt{boot.asm}, we defined a "Magic Number" (\texttt{0x1BADB002}) and some flags at the very top of our binary. When GRUB scans our file, it sees this magic number, recognizes it as a valid kernel, handles the messy hardware initialization, and jumps directly to our \texttt{\_start} label in 32-bit mode.
+A \textbf{linker script} (\texttt{linker.ld}) controls the physical memory layout of
+the final binary. When the CPU boots, it enters Real Mode at physical address
+\texttt{0x7C00} (where the bootloader lives). The GRUB bootloader then loads our
+kernel binary starting at physical address \texttt{0x100000} (the 1MB mark), which is
+the conventional load address for 32-bit kernels.
 
-\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/boot.asm]
-MBALIGN  equ  1 << 0
-MEMINFO  equ  1 << 1
-FLAGS    equ  MBALIGN | MEMINFO
-MAGIC    equ  0x1BADB002
-CHECKSUM equ -(MAGIC + FLAGS)
-
-section .multiboot
-align 4
-    dd MAGIC
-    dd FLAGS
-    dd CHECKSUM
-\end{lstlisting}
-
-\subsection{The Linker Script (\texttt{linker.ld})}
-Compilers just generate code; the \textbf{Linker} glues it together. By default, a linker might place our code at memory address \texttt{0x400000} (standard for Linux apps). However, standard x86 kernels are expected to be loaded exactly at the 1 Megabyte mark (\texttt{0x100000}). The \texttt{linker.ld} file forces the linker to put our Multiboot header at the very beginning of the binary file and sets the base memory address to 1MB. 
-
+Our linker script enforces this layout:
 \begin{lstlisting}[title=linker.ld]
 ENTRY(_start)
 
 SECTIONS {
-    . = 1M;
+    . = 1M;           /* Set the load address to exactly 1 Megabyte */
 
     .text BLOCK(4K) : ALIGN(4K) {
-        *(.multiboot)
-        *(.text)
+        *(.multiboot)  /* Multiboot header MUST come first */
+        *(.text)       /* All executable code sections */
     }
-    /* Data and BSS sections follow... */
+    .data BLOCK(4K) : ALIGN(4K) { *(.data) }
+    .bss  BLOCK(4K) : ALIGN(4K) { *(.bss)  }
 }
 \end{lstlisting}
 
-\section{Phase 2: The Display (VGA Driver)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{What is VGA?}
-VGA stands for \textbf{Video Graphics Array}. Created by IBM in 1987, it became the universal standard for PC displays. Specifically, we use \textbf{VGA Text Mode}. In this mode, the graphics card divides the screen into an 80x25 grid. Instead of drawing individual pixels, the OS writes ASCII characters to specific memory addresses, and the VGA hardware itself handles drawing the pixels of the font on the screen.
+The \texttt{BLOCK(4K)} directive aligns each section to a 4096-byte page boundary,
+which is required by the Paging hardware that we implement in a later chapter.
 
-\subsection{Memory-Mapped I/O (\texttt{kernel/vga.cpp})}
-In a normal C++ program, you print text using \texttt{std::cout}. In kernel space, \texttt{std} does not exist. We have to talk directly to the graphics hardware. 
+\newpage
 
-The graphics card constantly monitors a specific chunk of physical RAM starting at address \texttt{0xB8000}. Any bytes written to this address are immediately drawn on the screen as text. We created a pointer to \texttt{0xB8000} and marked it as \texttt{volatile} so the C++ optimizer wouldn't erase our memory writes.
+\chapter{Boot Sequence \& Display}
 
-\begin{lstlisting}[language=C++, title=kernel/vga.cpp]
-#include "vga.h"
+\section{The x86 Boot Process}
 
-// Pointer to VGA text mode buffer
+When an x86 computer is powered on, the CPU begins execution in \textbf{Real Mode},
+a 16-bit operating environment with a 1MB address space that dates back to the Intel
+8086 (1978). The CPU's instruction pointer is initialized to physical address
+\texttt{0xFFFF0}, which points to the motherboard's \textbf{BIOS} (Basic Input/Output
+System) firmware burned into ROM.
+
+The BIOS performs a \textbf{Power-On Self-Test (POST)}: it enumerates and tests the
+installed RAM, discovers peripheral devices, and initializes essential controllers.
+It then searches connected storage devices for a bootable medium by reading the very
+first 512-byte sector. If the last two bytes of that sector are the magic signature
+\texttt{0x55 0xAA}, the BIOS copies those 512 bytes to address \texttt{0x7C00} and
+transfers execution to it.
+
+Abyss OS bypasses the 512-byte limitation entirely by relying on \textbf{GRUB} (GNU
+GRand Unified Bootloader) as the first-stage loader. GRUB handles the transition
+from 16-bit Real Mode to 32-bit Protected Mode, sets up the initial stack, and loads
+our kernel binary from the ISO image.
+
+\section{The Multiboot Specification}
+
+GRUB uses the \textbf{Multiboot Specification} to identify a valid kernel binary.
+Our kernel must embed a specific magic structure within its first 8KB, which GRUB
+detects by scanning the binary. This structure contains:
+
+\begin{itemize}
+    \item \textbf{Magic Number} \texttt{0x1BADB002}: A fixed constant that GRUB scans for.
+    \item \textbf{Flags}: A bitmask requesting features from GRUB (e.g., module loading,
+    memory maps, video mode configuration).
+    \item \textbf{Checksum}: A value such that \texttt{Magic + Flags + Checksum == 0}.
+    This arithmetic check prevents GRUB from falsely identifying arbitrary data as a
+    Multiboot header.
+\end{itemize}
+
+When GRUB successfully locates and validates the header, it switches the CPU into
+32-bit Protected Mode, disables interrupts (\texttt{cli}), and calls our \texttt{\_start}
+label. At this moment, GRUB passes a critical pointer in the \texttt{EBX} register:
+the address of the \textbf{Multiboot Information Structure}, a rich data structure
+containing the physical RAM map, framebuffer address, and loaded module locations.
+
+\section{Protected Mode and Memory Segmentation}
+
+\textbf{Protected Mode} is the 32-bit operating mode of the x86 architecture,
+introduced by the Intel 80286. It expands the addressable memory space from 1MB
+(20-bit address bus) to 4GB (32-bit address bus) and introduces hardware-enforced
+memory protection via \textbf{Segmentation}.
+
+In Protected Mode, memory is no longer addressed directly. Instead, all memory
+accesses pass through a \textbf{Segment Register} (e.g., \texttt{CS} for code,
+\texttt{DS} for data). These registers contain \textbf{selectors} --- indices into the
+\textbf{Global Descriptor Table (GDT)}, which we explore in depth in Chapter 3.
+
+\section{VGA Text Mode and Memory-Mapped I/O}
+
+\textbf{VGA Text Mode} (specifically Mode 3) provides an 80-column $\times$ 25-row
+character grid. The graphics hardware monitors a specific region of the CPU's physical
+address space: \texttt{0xB8000}--\texttt{0xBFFFF}. This technique, where hardware
+devices appear directly in the CPU's memory map, is called \textbf{Memory-Mapped I/O (MMIO)}.
+
+Each character on screen is represented by two bytes in this region:
+\begin{itemize}
+    \item \textbf{Low byte}: The ASCII character code.
+    \item \textbf{High byte}: The color attribute. Bits 0--3 are the foreground color;
+    bits 4--6 are the background color; bit 7 enables blinking. For example,
+    \texttt{0x0F} represents bright white (\texttt{0xF}) on black (\texttt{0x0}).
+\end{itemize}
+
+The VGA controller continuously \textit{scans} this buffer at the display refresh rate
+(typically 60--70 Hz) and converts the ASCII codes to actual pixel glyphs using its
+internal character generator ROM. The OS simply writes bytes to RAM; the hardware
+handles all the actual rendering.
+
+\begin{lstlisting}[language=C++, title=kernel/vga.cpp -- Core MMIO interaction]
 volatile uint16_t* vga = (uint16_t*)0xB8000;
-int cursor_pos = 0;
 
 void vga_print_char(char c) {
-    if (c == '\b') { // Backspace
-        if (cursor_pos > 0) {
-            cursor_pos--;
-            vga[cursor_pos] = (0x0F << 8) | ' ';
-        }
-    } else {
-        // Upper byte: color (0x0F = white on black)
-        // Lower byte: ASCII character
-        vga[cursor_pos] = (0x0F << 8) | c;
-        cursor_pos++;
-    }
+    vga[cursor_pos] = (0x0F << 8) | c; // Color | ASCII
+    cursor_pos++;
 }
 \end{lstlisting}
 
-\section{Phase 3: The Brain (GDT - Global Descriptor Table)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{What is the GDT?}
-The \textbf{Global Descriptor Table (GDT)} is a fundamental data structure in the x86 architecture. Introduced to provide memory protection, the GDT is an array of 8-byte entries (descriptors). Each entry describes a "segment" of memory, detailing where the segment starts (Base), how large it is (Limit), and what permissions it has (Executable, Readable, Writable, Ring 0 vs Ring 3 privileges).
+The \texttt{volatile} keyword is essential here. Without it, the C++ optimizer might
+determine that the value written to memory is never \textit{read back} by the program
+and eliminate the write entirely. \texttt{volatile} guarantees that every write is
+committed to the physical address, preventing the optimizer from discarding MMIO writes.
 
-\subsection{Building the GDT (\texttt{kernel/gdt.cpp})}
-We built a GDT in RAM containing three highly-specific 8-byte entries:
-\begin{enumerate}
-    \item \textbf{Null Descriptor:} Required by the CPU to catch null-pointer errors.
-    \item \textbf{Kernel Code Segment:} Defines memory as executable code for Ring 0.
-    \item \textbf{Kernel Data Segment:} Defines memory as readable and writable for Ring 0.
-\end{enumerate}
+\newpage
 
-\begin{lstlisting}[language=C++, title=kernel/gdt.cpp]
-void gdt_init() {
-    gdtr.limit = sizeof(gdt) - 1;
-    gdtr.base = (uint32_t)&gdt;
+\chapter{CPU Architecture: GDT, IDT, PIC, and Exceptions}
 
-    gdt_set_gate(0, 0, 0, 0, 0);                // Null segment
-    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Code segment (Ring 0)
-    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Data segment (Ring 0)
+\section{The Global Descriptor Table (GDT)}
 
-    gdt_flush(&gdtr);
-}
-\end{lstlisting}
+\subsection{Segmentation and the Need for the GDT}
 
-\subsection{Loading the GDT (\texttt{boot/gdt\_flush.asm})}
-We told the CPU where our table was using the \texttt{lgdt} assembly instruction. However, the CPU's Code Segment (\texttt{CS}) register cannot be updated directly with a \texttt{mov} instruction. We had to perform a \textbf{Far Jump} (\texttt{jmp 0x08:.flush}) to force the CPU to flush its pipeline and start using our new Kernel Code Segment (selector \texttt{0x08}).
+In Protected Mode, x86 uses a two-layer memory protection system: \textbf{Segmentation}
+and \textbf{Paging}. Segmentation is the first layer. Every memory access the CPU makes
+is relative to a \textit{segment}, which defines a contiguous region of memory with
+specific access permissions.
+
+The GDT is an array of \textbf{8-byte segment descriptors} that lives in RAM. Its
+physical address is communicated to the CPU via the \texttt{lgdt} instruction, which
+loads the address into the CPU's hidden \texttt{GDTR} register (Global Descriptor Table
+Register).
+
+\subsection{Descriptor Format}
+
+Each 8-byte descriptor has a complex, non-contiguous bit layout for historical
+compatibility reasons:
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{Bits} & \textbf{Field} & \textbf{Width} & \textbf{Purpose} \\
+\hline
+0--15   & Limit (low)  & 16 bits & Lower 16 bits of segment size \\
+16--39  & Base (low)   & 24 bits & Lower 24 bits of base address \\
+40--47  & Access byte  & 8 bits  & Privilege level, type, present flag \\
+48--51  & Limit (high) & 4 bits  & Upper 4 bits of segment size \\
+52--55  & Flags        & 4 bits  & 32-bit mode, granularity \\
+56--63  & Base (high)  & 8 bits  & Upper 8 bits of base address \\
+\hline
+\end{tabular}
+\end{center}
+
+The \textbf{Access Byte} is the most important field. Its bit layout determines
+the type and privilege of the segment:
+\begin{itemize}
+    \item \textbf{Bit 7 (Present)}: Must be 1 for valid descriptors.
+    \item \textbf{Bits 5--6 (DPL)}: Descriptor Privilege Level (Ring 0--3).
+    \item \textbf{Bit 4}: 1 for code/data segments, 0 for system segments.
+    \item \textbf{Bit 3 (Executable)}: 1 for code segments, 0 for data.
+    \item \textbf{Bit 1 (R/W)}: Readable (code) or writable (data) flag.
+\end{itemize}
+
+\subsection{The Far Jump and Segment Register Flush}
+
+After loading the new GDT with \texttt{lgdt}, the CPU's \textit{segment descriptor
+caches} (hidden registers that cache the properties of the current segments) still
+hold the old BIOS values. Simply updating the data segment registers (\texttt{DS},
+\texttt{ES}, etc.) with \texttt{mov} instructions is sufficient for those --- but
+the \texttt{CS} (Code Segment) register cannot be updated with a \texttt{mov}.
+
+The only way to load a new value into \texttt{CS} is via a \textbf{Far Jump}
+(\texttt{jmp seg:offset}), which atomically updates \texttt{CS} and flushes the CPU's
+instruction pipeline, forcing it to re-fetch instructions under the new segmentation:
 
 \begin{lstlisting}[language={[x86masm]Assembler}, title=boot/gdt\_flush.asm]
-global gdt_flush
-gdt_flush:
-    mov eax, [esp+4] ; Load the GDTR pointer
-    lgdt [eax]       ; Load the new GDT
-
-    mov ax, 0x10     ; Load data segment selector (0x10)
+    lgdt [eax]       ; Load the GDT pointer
+    mov ax, 0x10     ; Selector 0x10 = 3rd descriptor = Kernel Data
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ss, ax
-
-    jmp 0x08:.flush  ; Far jump to code segment (0x08)
+    jmp 0x08:.flush  ; Far jump: CS = selector 0x08 = Kernel Code
 .flush:
     ret
 \end{lstlisting}
 
-\section{Phase 4: The Nervous System (IDT - Interrupt Descriptor Table)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{What is the IDT?}
-The \textbf{Interrupt Descriptor Table (IDT)} is the mechanism the CPU uses to handle events that interrupt normal execution. These events include hardware interrupts, software interrupts, and CPU exceptions. The IDT is an array of exactly 256 entries pointing to Interrupt Service Routines (ISRs).
+\section{The Interrupt Descriptor Table (IDT)}
 
-\subsection{Building the IDT (\texttt{kernel/idt.cpp})}
-We defined the 256-entry table and initialized every entry. If an interrupt fires on a zeroed entry, the CPU panics.
+\subsection{The Interrupt Mechanism}
 
-\begin{lstlisting}[language=C++, title=kernel/idt.cpp]
-void idt_set_gate(int num, uint32_t base, uint16_t sel, uint8_t flag) {
-    idt[num].base_low = base & 0xFFFF;
-    idt[num].base_high = (base >> 16) & 0xFFFF;
-    idt[num].sel = sel;
-    idt[num].zero = 0;
-    idt[num].flags = flag;
-}
-\end{lstlisting}
+An \textbf{interrupt} is a hardware or software signal that causes the CPU to
+temporarily suspend its current execution stream and transfer control to a specific
+handler function. Interrupts are the fundamental mechanism through which hardware
+communicates asynchronously with the software running on the CPU.
 
-\section{Phase 5: The PIC and Hardware I/O}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{What is the PIC?}
-The \textbf{Programmable Interrupt Controller (8259 PIC)} manages hardware interrupts. When you press a key on the keyboard, it sends an electrical signal (an \textbf{IRQ}) to the PIC. The PIC then tells the CPU to handle the keyboard.
+The x86 architecture defines 256 possible interrupt vectors (numbered 0--255). The
+\textbf{IDT} is an array of 256 \textbf{gate descriptors}, each pointing to the
+corresponding Interrupt Service Routine (ISR). The CPU's \texttt{IDTR} register
+holds the base address and size of this table.
 
-\subsection{Remapping the PIC (\texttt{kernel/pic.cpp})}
-By default, the old BIOS maps the PIC's IRQ 0-7 to Interrupts 8-15 in the IDT, colliding with Intel's reserved CPU Exceptions. We wrote a driver that uses inline assembly (\texttt{inb} and \texttt{outb} in \texttt{io.h}) to send Initialization Command Words (ICWs) to the PIC chips to shift their interrupts to 32-47.
+\subsection{Interrupt Vector Classification}
 
-\begin{lstlisting}[language=C++, title=kernel/pic.cpp]
-void pic_remap(int offset1, int offset2) {
-    // Wake up and Reset (ICW1)
-    outb(0x20, 0x11);
-    outb(0xA0, 0x11);
-    
-    // Remap offsets (ICW2)
-    outb(0x21, offset1); // Master starts at 32
-    outb(0xA1, offset2); // Slave starts at 40
-    
-    // Master-Slave Wiring (ICW3)
-    outb(0x21, 4);
-    outb(0xA1, 2);
-    
-    // x86 Mode (ICW4)
-    outb(0x21, 0x01);
-    outb(0xA1, 0x01);
-}
-\end{lstlisting}
+The 256 vectors are partitioned as follows:
+\begin{itemize}
+    \item \textbf{0--31}: Intel-reserved CPU Exceptions (e.g., \#DE Division by Zero,
+    \#PF Page Fault, \#GP General Protection Fault). These cannot be remapped.
+    \item \textbf{32--255}: Available for OS and hardware use. We map hardware IRQs
+    here after remapping the PIC.
+\end{itemize}
 
-\section{Phase 6: Exception Handling (The Kernel Panic)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{Standardizing the Stack Frame (\texttt{boot/interrupts.asm})}
-We needed 32 Interrupt Service Routines (ISRs) for CPU exceptions. We used NASM macros to generate them dynamically. Some exceptions push an error code; others do not. Our macro pushes a dummy \texttt{0} for those that don't to keep the stack uniform.
+\subsection{The Gate Descriptor}
 
-\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/interrupts.asm]
-%macro ISR_NOERRCODE 1
-  global isr%1
-  isr%1:
-    push 0      ; Dummy error code
-    push %1     ; Interrupt number
-    jmp isr_common_stub
-%endmacro
+An IDT gate descriptor is 8 bytes and contains the full \texttt{selector:offset}
+address of the ISR, plus a type/attribute byte. The \textbf{DPL field} in the
+attribute byte is critical: it defines the minimum privilege level required to
+trigger this interrupt via a software \texttt{int} instruction. Setting DPL to 3
+(Ring 3) on interrupt 128 (\texttt{0x80}) allows User Mode programs to legally
+invoke the kernel's system call handler.
 
-isr_common_stub:
-    pusha        ; Save registers
-    push esp     ; Pass stack pointer to C++
-    call fault_handler
-    add esp, 4
-    popa         ; Restore registers
-    add esp, 8
-    iret
-\end{lstlisting}
+\section{The Programmable Interrupt Controller (8259 PIC)}
 
-\subsection{Mapping C++ Structs over CPU Memory (\texttt{kernel/isr.cpp})}
-In C++, we defined a struct (\texttt{regs\_t}) that mirrors the data pushed to the Stack. This allows us to access \texttt{r->int\_no} to determine which exception occurred and print a Kernel Panic message.
+\subsection{IRQ Routing}
 
-\begin{lstlisting}[language=C++, title=kernel/isr.cpp]
-struct regs_t {
-    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax; // Pushed by pusha
-    uint32_t int_no, err_code;                       // Pushed by macros
-    uint32_t eip, cs, eflags, useresp, ss;           // Pushed by CPU
-};
+Physical hardware devices (keyboard, mouse, disk controller, timer) communicate with
+the CPU not by writing to memory, but by asserting an electrical signal on a dedicated
+wire called an \textbf{Interrupt Request (IRQ) line}. The \textbf{8259A Programmable
+Interrupt Controller} arbitrates these 15 hardware IRQs and delivers them to the
+CPU as interrupt vectors.
 
-extern "C" void fault_handler(struct regs_t* r) {
-    if (r->int_no < 32) {
-        vga_clear();
-        vga_print("KERNEL PANIC! CPU EXCEPTION: ");
-        vga_print(exception_messages[r->int_no]);
-        
-        while(1) { asm volatile("cli; hlt"); }
-    }
-}
-\end{lstlisting}
+The original IBM PC BIOS maps IRQ0--IRQ7 to CPU vectors 8--15. This collides directly
+with Intel's reserved exception vectors (e.g., vector 8 is a Double Fault exception).
+The OS \textit{must} remap the PIC to a safe range during initialization.
 
-\section{Phase 7: Memory Management (Paging)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Danger of Physical RAM}
-Before Paging, our C++ kernel operated in a Flat Memory Model, meaning it had direct, unfiltered access to the physical RAM sticks on the motherboard. If a rogue program wrote to an invalid address, it could overwrite the kernel and crash the entire system. 
+\subsection{PIC Initialization Sequence (ICW)}
 
-To solve this, we implemented \textbf{Paging}. Paging is a hardware feature that intercepts every single memory request from the CPU and secretly redirects it to a different physical address using a map. This creates a "Virtual Memory" space, allowing us to sandbox applications, allocate dynamic memory (\texttt{malloc}), and protect the kernel.
+The 8259 is programmed by sending a sequence of \textbf{Initialization Command Words
+(ICW)} to its I/O ports. The master PIC lives at ports \texttt{0x20}/\texttt{0x21};
+the slave at \texttt{0xA0}/\texttt{0xA1}.
 
-\subsection{The Two-Tier Hierarchy}
-Because creating a single massive map for 4GB of RAM would waste 4MB of RAM just to store the map itself, Intel uses a two-tier hierarchy:
 \begin{enumerate}
-    \item \textbf{Page Directory:} A 4KB table containing 1024 pointers to Page Tables.
-    \item \textbf{Page Table:} A 4KB table containing 1024 pointers to physical 4KB memory \textbf{Pages}.
+    \item \textbf{ICW1} (\texttt{0x11} to command port): Start initialization, expect ICW4.
+    \item \textbf{ICW2} (to data port): The new vector offset. We use 32 for master (IRQ0=32),
+    40 for slave (IRQ8=40).
+    \item \textbf{ICW3}: Describes the master/slave wiring topology.
+    \item \textbf{ICW4} (\texttt{0x01}): Sets 8086/88 mode.
 \end{enumerate}
 
-\subsection{Identity Mapping (\texttt{kernel/paging.cpp})}
-To prevent our kernel from crashing the moment Paging was enabled, we had to "Identity Map" the first 4 Megabytes of RAM. This ensures that Virtual Address \texttt{0x1000} points exactly to Physical Address \texttt{0x1000}.
+After remapping, the PIC must send an \textbf{End of Interrupt (EOI)} signal
+(\texttt{0x20} to port \texttt{0x20}) at the end of every IRQ handler, otherwise the
+PIC will not deliver any further interrupts of equal or lower priority.
 
-The CPU requires these tables to be perfectly aligned to 4096-byte boundaries in RAM (\texttt{\_\_attribute\_\_((aligned(4096)))}). Because the CPU assumes the bottom 12 bits of the address are zeroes, it reuses those 12 bits to store permissions (like Read/Write and Present flags). We used a bitwise OR (\texttt{| 7}) to set the Present, Read/Write, and User Access flags to true.
+\section{CPU Exceptions and Kernel Panics}
 
-\begin{lstlisting}[language=C++, title=kernel/paging.cpp]
-struct page_directory_t page_directory __attribute__((aligned(4096)));
-struct page_table_t first_page_table __attribute__((aligned(4096)));
+The 32 CPU exceptions are the processor's way of signaling that something has gone
+catastrophically wrong. The most important ones for OS development are:
 
-void init_paging() {
-    for(int i = 0; i < 1024; i++) {
-        page_directory.tablesPhysical[i] = 0x02; // Not Present
-    }
-
-    // Identity Map the first 4MB
-    for(int i = 0; i < 1024; i++) {
-        first_page_table.pages[i] = (i * 4096) | 7; // Present, R/W, User Access
-    }
-
-    page_directory.tablesPhysical[0] = ((uint32_t)&first_page_table) | 7;
-}
-\end{lstlisting}
-
-\subsection{Flipping the Switch (\texttt{boot/paging.asm})}
-With the tables built in RAM, we passed the physical address of the Page Directory to the CPU's \texttt{cr3} register. Finally, we enabled the 31st bit of the \texttt{cr0} control register. The exact millisecond that bit flipped to 1, physical memory addressing was disabled, and Abyss seamlessly transitioned into Virtual Memory space without skipping a single CPU cycle.
-
-\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/paging.asm]
-load_page_directory:
-    push ebp
-    mov ebp, esp
-    mov eax, [ebp+8]   
-    mov cr3, eax       ; Load the Page Directory pointer
-    mov esp, ebp
-    pop ebp
-    ret
-
-enable_paging:
-    push ebp
-    mov ebp, esp
-    mov eax, cr0
-    or eax, 0x80000000 ; Flip the 31st bit (Paging Bit) to 1
-    mov cr0, eax       ; Paging turns ON!
-    mov esp, ebp
-    pop ebp
-    ret
-\end{lstlisting}
-
-\section{Phase 8: The Abyss Shell (Interactive CLI)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Need for a String Library (\texttt{kernel/string.cpp})}
-An interactive shell requires the ability to compare the characters typed by the user against known commands (like \texttt{"clear"} or \texttt{"ping"}). However, because Abyss runs on bare metal, standard C++ libraries like \texttt{<string>} or \texttt{<cstring>} do not exist. 
-
-To solve this, we built a custom string library from scratch. We implemented our own \texttt{strcmp} function that iterates through two character arrays, comparing them byte-by-byte until a null-terminator (\texttt{'\textbackslash 0'}) is reached.
-
-\subsection{The Keyboard Buffer (\texttt{kernel/isr.cpp})}
-Previously, our keyboard interrupt handler (\texttt{isr33\_handler}) simply printed characters directly to the VGA display. To create a shell, we introduced a keyboard buffer (\texttt{char keyboard\_buffer[256]}) to store keystrokes in memory.
-
-When a keyboard hardware interrupt fires, we check the character:
 \begin{itemize}
-    \item \textbf{Newline (\texttt{'\textbackslash n'}):} The user pressed Enter. We trigger the \texttt{execute\_command()} function.
-    \item \textbf{Backspace (\texttt{'\textbackslash b'}):} We decrement the buffer index and visually erase the character from the VGA display by instructing the VGA driver to print a space character over it.
-    \item \textbf{Standard Characters:} We append the character to the buffer and print it to the screen.
+    \item \textbf{\#PF (14) --- Page Fault}: Triggered when a program accesses a virtual
+    address that has no corresponding physical mapping in the Page Tables, or when it
+    attempts to write to a read-only page. The faulting address is stored in the
+    \texttt{CR2} register, which is invaluable for debugging.
+    \item \textbf{\#GP (13) --- General Protection Fault}: Triggered by any attempt to
+    violate x86 protection rules --- for example, a Ring 3 program trying to execute a
+    privileged instruction like \texttt{cli} (disable interrupts) or accessing a
+    segment it does not have permission for.
+    \item \textbf{\#DF (8) --- Double Fault}: Triggered when the CPU encounters a fault
+    \textit{while already processing a fault}. A Double Fault almost always indicates a
+    corrupted kernel stack or a broken IDT.
 \end{itemize}
 
-\subsection{Executing Commands}
-When the Enter key is pressed, \texttt{execute\_command()} null-terminates the buffer so our \texttt{strcmp} function knows where the string ends. It then compares the buffer against a list of hardcoded commands. 
+For exceptions that push an \textbf{error code} onto the stack (e.g., \#PF, \#GP),
+the ISR must pop this code before executing \texttt{iret}, otherwise the stack is
+misaligned and the CPU will immediately triple-fault and reset.
 
-If the user types \texttt{clear}, we call \texttt{vga\_clear()}. If the user types a custom "curse" word, we trigger a Non-Maskable Interrupt (\texttt{asm volatile("int \$0x2");}), deliberately invoking our Kernel Panic safety net to freeze the system. Finally, the buffer is reset to 0, and the \texttt{Abyss >>} prompt is redrawn, creating a fully interactive OS experience.
+\newpage
 
-\section{Phase 9: The Task State Segment (TSS)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Ring 3 Interrupt Problem}
-When the CPU is operating in Ring 0 (Kernel Mode) and a hardware interrupt fires, the CPU simply pushes the current state onto the stack and handles the interrupt. However, when the CPU is in Ring 3 (User Mode), it cannot use the User Stack to handle interrupts, as the User Stack might be corrupted or lack the necessary privileges. The CPU must switch back to the secure Ring 0 Kernel Stack.
+\chapter{Memory Management}
 
-But how does the CPU know where the Kernel Stack is located? 
+\section{Virtual Memory and Paging}
 
-\subsection{The TSS Structure (\texttt{kernel/tss.cpp})}
-Intel solved this by requiring the OS to maintain a \textbf{Task State Segment (TSS)}. While the TSS has many legacy fields from ancient hardware task-switching mechanisms, modern operating systems only use two fields: \texttt{ss0} (the Ring 0 Stack Segment) and \texttt{esp0} (the Ring 0 Stack Pointer).
+\subsection{The Isolation Problem}
 
-We created a TSS structure in memory, zeroed it out, and populated \texttt{ss0} with \texttt{0x10} (our Kernel Data Segment) and \texttt{esp0} with the exact memory address of our Kernel Stack. 
+In a flat physical memory model, every process can read and write any address in RAM.
+A bug in one program can silently corrupt the kernel or another process's data. This
+is fundamentally unsafe for a multi-process OS.
 
-\subsection{Loading the TSS}
-To tell the CPU where this structure lives, we added a 6th entry to our Global Descriptor Table (GDT) pointing to the TSS, using the access byte \texttt{0xE9} (Present, Ring 3, 32-bit TSS). Finally, we used the \texttt{ltr} (Load Task Register) assembly instruction to officially lock the TSS into the CPU hardware.
+\textbf{Virtual Memory} solves this by introducing an abstraction layer between the
+addresses a program uses (virtual addresses) and the actual physical RAM locations.
+Every process sees a private, contiguous address space (e.g., always starting at
+\texttt{0x00000000} and spanning 4GB), even though the underlying physical RAM is
+fragmented and shared.
 
-\section{Phase 10: User Mode (Ring 3)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Fake Interrupt Return (\texttt{boot/usermode.asm})}
-The x86 architecture does not have a simple instruction to switch from Ring 0 to Ring 3. To enter User Mode, we must trick the CPU. 
+\subsection{The Two-Level Page Table Hierarchy}
 
-When returning from an interrupt, the CPU executes the \texttt{iret} (Interrupt Return) instruction, which pops five values off the stack: the User's \texttt{SS}, \texttt{ESP}, \texttt{EFLAGS}, \texttt{CS}, and \texttt{EIP}. By manually pushing these five values onto the stack (using our new Ring 3 GDT segment selectors \texttt{0x1B} and \texttt{0x23}) and manually executing \texttt{iret}, the CPU is tricked into seamlessly resuming execution in Ring 3.
+x86 implements virtual memory through \textbf{Paging}. The 32-bit virtual address
+space (4GB) is divided into \textbf{pages} of 4096 bytes each ($2^{12}$ bytes,
+hence the bottom 12 bits of an address are the \textit{page offset}).
 
-\subsection{Paging Permissions}
-When we first jumped into Ring 3, the CPU immediately threw a \textbf{Page Fault}. This occurred because our Paging system originally mapped the memory with permissions \texttt{0x03} (Present, Read/Write, but strictly Ring 0). The Memory Management Unit blocked the Ring 3 code from executing. 
+A naive approach would be a single 4GB/4KB = 1,048,576-entry lookup table --- but
+storing 1 million 4-byte entries requires 4MB of RAM \textit{per process}, just for
+the table itself. x86 solves this with a two-level hierarchy:
 
-We updated our Page Table permissions to \texttt{0x07} (Binary \texttt{111}), explicitly granting User Mode access to the memory pages. 
+\begin{enumerate}
+    \item \textbf{Page Directory (PD)}: 1024 entries, each pointing to a Page Table.
+    The top 10 bits of the virtual address (bits 22--31) index into the PD.
+    \item \textbf{Page Table (PT)}: 1024 entries, each pointing to a physical 4KB page.
+    The next 10 bits (bits 12--21) index into the PT.
+    \item \textbf{Page Offset}: The bottom 12 bits (bits 0--11) are added to the
+    physical page base address to produce the final physical address.
+\end{enumerate}
 
-\subsection{The Sandbox}
-Once Paging permissions were fixed, our Ring 3 test function executed successfully. To prove we were truly restricted, we attempted to execute \texttt{cli} (Clear Interrupts)---a privileged Ring 0 instruction. As expected, the CPU's hardware security intercepted the illegal operation and threw a \textbf{General Protection Fault}, triggering our Kernel Panic and safely halting the system before any damage could occur. Abyss OS now has a fully secure application sandbox.
+Address translation formula:
+\[
+\text{Physical Address} = \text{PT}[\text{PD}[\text{VAddr}[31{:}22]][VAddr[21{:}12]]] + VAddr[11{:}0]
+\]
 
-\section{Phase 11: Dynamic Memory (The Heap)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Need for Dynamic Allocation}
-In early development, all memory allocation was static. Arrays like \texttt{char keyboard\_buffer[256]} were hardcoded into the binary at compile time. However, to build a robust OS, the system must be able to allocate memory on the fly at runtime (e.g., dynamically sizing a buffer to load a file from disk). In standard C/C++, this is handled by \texttt{malloc()} and \texttt{free()}, but in a bare-metal kernel, we must build the memory allocator from scratch.
+\subsection{Page Table Entry Format}
 
-\subsection{The Bump Allocator (\texttt{kernel/memory.cpp})}
-We implemented a \textbf{Bump Allocator}, which is the simplest form of dynamic memory allocation. Because our Paging system identity-maps the first 4 Megabytes of physical RAM, and our kernel occupies the 1MB mark (\texttt{0x100000}), we safely designated the 2MB mark (\texttt{0x200000}) as the start of our "Heap".
+Each 4-byte Page Table Entry encodes both the physical page address and permission flags.
+Since pages are always 4KB-aligned, the bottom 12 bits of the address are always zero,
+so the hardware reuses them as flags:
 
-The allocator maintains a single global pointer (\texttt{current\_heap\_pointer}). When a program requests memory via \texttt{malloc(size)}, the allocator saves the current pointer to return to the user, and then simply "bumps" the global pointer forward by the requested size.
+\begin{itemize}
+    \item \textbf{Bit 0 (Present)}: 1 = this page is mapped; 0 = accessing this page
+    triggers a Page Fault (used to implement demand paging and swap).
+    \item \textbf{Bit 1 (R/W)}: 0 = read-only; 1 = read-write.
+    \item \textbf{Bit 2 (U/S)}: 0 = supervisor only (Ring 0); 1 = accessible by user
+    space (Ring 3).
+    \item \textbf{Bits 3--11}: Accessed, Dirty, Global, and other hardware flags.
+    \item \textbf{Bits 12--31}: The upper 20 bits of the physical page frame address.
+\end{itemize}
+
+\subsection{Enabling Paging}
+
+The Page Directory's physical address is loaded into the \textbf{CR3} control register.
+Paging is then activated by setting \textbf{bit 31 of CR0} (the ``PG'' bit). The moment
+this bit is set, \textit{every subsequent memory access} by the CPU is transparently
+translated through the page tables. Identity mapping the first 4MB (virtual address =
+physical address for the first 4MB) ensures the kernel does not crash immediately when
+paging is enabled.
+
+\section{Dynamic Memory: The Heap Allocator}
+
+\subsection{Stack vs. Heap Allocation}
+
+Local variables in C++ are allocated on the \textbf{stack} --- a fixed-size region of
+memory (typically a few kilobytes to a few megabytes) that grows and shrinks with
+function calls. Stack allocation is extremely fast (a single decrement of the \texttt{ESP}
+register) but limited in size and lifetime (the memory is reclaimed when the function returns).
+
+The \textbf{heap} is a pool of memory reserved for \textit{dynamic} allocation. Memory
+on the heap persists until explicitly freed, regardless of which function allocated it.
+This is necessary for data structures whose size is not known at compile time.
+
+\subsection{The Bump Allocator}
+
+The simplest possible heap allocator is the \textbf{bump allocator} (also called a
+linear allocator or arena allocator). It maintains a single pointer to the ``watermark''
+of the heap. Allocation simply advances this pointer by the requested size:
 
 \begin{lstlisting}[language=C++, title=kernel/memory.cpp]
-uint32_t heap_start = 0x200000;
-uint32_t current_heap_pointer;
-
-void memory_init() {
-    current_heap_pointer = heap_start;
-}
+uint32_t heap_ptr = 0x200000; // Start of heap at 2MB mark
 
 void* malloc(size_t size) {
-    uint32_t allocated_address = current_heap_pointer;
-    current_heap_pointer += size;
-    return (void*)allocated_address;
+    uint32_t addr = heap_ptr;
+    heap_ptr += size;          // "Bump" the pointer forward
+    return (void*)addr;
 }
 \end{lstlisting}
 
-While highly efficient for allocation, a pure Bump Allocator has a major limitation: it cannot free memory. More advanced allocators (like linked-list or buddy allocators) are required to track freed blocks and prevent memory exhaustion. However, the Bump Allocator provides a perfect foundation for initial kernel operations.
+\textbf{Time complexity}: O(1) for allocation.\\
+\textbf{Limitation}: \texttt{free()} is a no-op. Memory cannot be reclaimed.
 
-\section{Phase 12: The System Timer (PIT)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Metronome of the OS}
-An operating system requires a concept of time to schedule tasks, pause execution (\texttt{sleep()}), or track uptime. On x86 architecture, this is handled by the \textbf{Programmable Interval Timer (PIT)}, a hardware chip that acts like a metronome. It triggers a hardware interrupt at a highly specific frequency.
-
-\subsection{Configuring the PIT (\texttt{kernel/timer.cpp})}
-The base hardware clock of the PIT runs at 1,193,180 Hz. To make the timer tick at a human-readable speed (like 100 Hz, or 100 times per second), we calculate a divisor: \texttt{1193180 / 100}.
-
-Using our I/O ports, we send a command byte to the PIT's command port (\texttt{0x43}) to configure it as a rate generator. We then send our calculated divisor to the PIT's data port (\texttt{0x40}). Because the data port only accepts 8 bits (1 byte) at a time, we use a bitwise AND mask (\texttt{\& 0xFF}) to split our 32-bit integer into two 8-bit chunks, sending the lowest byte first, followed by the highest byte.
-
-\subsection{Handling the Interrupt}
-Because the PIT is physically wired to IRQ 0 on the motherboard, and we remapped our PIC to start at offset 32, every tick of the timer triggers \textbf{Interrupt 32} in our IDT. 
-
-We updated our \texttt{isr32\_handler} to call a \texttt{timer\_tick()} function, which simply increments a global \texttt{tick\_count} variable. Finally, we wrote a custom integer-to-string (\texttt{itoa}) conversion algorithm in our string library, allowing our interactive shell to query the timer and print the system uptime directly to the screen!
-
-\section{Phase 13: System Calls (The Bridge)}
-{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
-\subsection{The Sandbox Limitation}
-While User Mode successfully protects the kernel from malicious or buggy applications, it introduces a major limitation: Ring 3 programs are physically blocked from interacting with hardware. A Ring 3 program cannot execute \texttt{inb} to read the keyboard, nor can it write to the VGA memory at \texttt{0xB8000}. If it tries, the Memory Management Unit throws a Page Fault, or the CPU throws a General Protection Fault.
-
-If an application cannot read input or print output, it is entirely useless.
-
-\subsection{Software Interrupts (\texttt{int 0x80})}
-To solve this, modern operating systems implement \textbf{System Calls}. A System Call is a deliberate, controlled software interrupt. In Linux, and in Abyss, this is historically mapped to interrupt vector \texttt{0x80} (128 in decimal).
-
-We updated our IDT to register \texttt{isr128}. Crucially, we assigned it an access flag of \texttt{0xEE} (Present, Ring 3, 32-bit Interrupt Gate). This specific flag overrides the standard security checks and legally permits a Ring 3 program to trigger this one specific Ring 0 interrupt.
-
-\subsection{Passing Arguments via Registers}
-When a User Mode program needs the kernel to perform an action (like printing text), it cannot simply pass C++ variables, as the stack contexts are completely different. Instead, it places arguments into the CPU's general-purpose registers before triggering the interrupt:
+Production kernels use more sophisticated allocators:
 \begin{itemize}
-    \item \textbf{\texttt{EAX}:} The System Call Number (e.g., \texttt{1} = Print String).
-    \item \textbf{\texttt{EBX}:} The first argument (e.g., A memory pointer to the string).
+    \item \textbf{Linked-list allocator}: Maintains a free-list of released blocks,
+    merging adjacent free blocks (coalescing) to prevent fragmentation.
+    \item \textbf{Buddy allocator}: Splits memory into power-of-two blocks; merging
+    is efficient because a block's ``buddy'' is at a predictable offset.
+    \item \textbf{Slab allocator} (Linux): Pre-allocates pools of fixed-size objects
+    to minimize fragmentation for frequent kernel allocations like task structures.
 \end{itemize}
 
-\subsection{The Dispatcher (\texttt{kernel/isr.cpp})}
-When \texttt{int 0x80} is triggered, the CPU safely pauses the User Mode application, switches to the secure Kernel Stack (using the TSS we built in Phase 9), and jumps into Ring 0 to execute our \texttt{fault\_handler}.
+\newpage
 
-We updated the handler to intercept \texttt{int\_no == 128}. The kernel acts as a Dispatcher: it reads the command number from \texttt{EAX}, retrieves the string pointer from \texttt{EBX}, and securely calls \texttt{vga\_print()} on behalf of the User Mode application. Once the text is drawn, the kernel executes \texttt{iret}, seamlessly dropping back into Ring 3 and resuming the application exactly where it left off.
+\chapter{Kernel Services}
 
-\section{Phase 14: Multitasking (The Scheduler)}
-{\small\textit{\textbf{Completed:} August 19, 2026}}\par\medskip
-\subsection{The Illusion of Parallelism}
-A single-core CPU can only execute one instruction at a time. To run multiple programs "simultaneously," an Operating System must rapidly switch between them, creating the illusion of parallel execution. This requires a Scheduler.
+\section{The Interactive Shell}
 
-\subsection{The Task Structure (TCB)}
-We created a \texttt{Task} structure (often called a Thread Control Block) to hold the state of a program when it is paused. Crucially, it stores the CPU's Stack Pointers (\texttt{ESP} and \texttt{EBP}). We connected these Tasks into a Circular Linked List to form our \texttt{ready\_queue}.
+A kernel without user interaction is a black box. The \textbf{command-line shell}
+is the most fundamental interactive interface between the user and the OS. It requires
+three building blocks: keyboard input (via the IRQ handler), a string buffer to
+accumulate keystrokes, and a command dispatcher that maps strings to functions.
 
-\subsection{The Isolated Stack}
-Every task must have its own isolated stack. If two tasks shared a stack, returning from a function in one task would pop the return address of the other task, instantly corrupting the CPU execution flow. When we call \texttt{create\_task}, we allocate a fresh 4KB block of memory for the task's private stack.
+The keyboard IRQ (IRQ 1, vector 33) fires on every key press and release. The handler
+reads a \textbf{scancode} from I/O port \texttt{0x60} --- a hardware-specific byte
+indicating which physical key changed state. A \textbf{scancode-to-ASCII lookup table}
+maps these scancodes to printable characters.
 
-\subsection{The Context Switch Trap}
-Switching to an already-running task is easy, as its stack contains the correctly pushed registers from when it was paused. However, switching to a brand new task is dangerous, as its stack is empty. To solve this, our C++ code manually injects a "fake" state into the new task's stack (including the Instruction Pointer and dummy registers) so that the Assembly context switch can safely \texttt{popa} and \texttt{ret} into the new function.
+\section{Memory Segmentation and Ring Isolation: The TSS}
 
-\subsection{The Assembly Switch (\texttt{boot/task.asm})}
-The \texttt{perform\_task\_switch} function is the heart of the OS. It pushes all current registers (\texttt{pusha}) to save the active task's state on its own stack. It then updates the \texttt{current\_task} pointer, swaps the CPU's \texttt{ESP} to point to the next task's stack, pops the registers (\texttt{popa}), and executes \texttt{ret} to resume the new task. We successfully proved this by running two infinite loops (Task A and Task B) that voluntarily yielded control to each other!
+\subsection{Privilege Rings}
 
-\section{Phase 15: Preemptive Multitasking}
-{\small\textit{\textbf{Completed:} August 20, 2026}}\par\medskip
-\subsection{The Metronome of the OS}
-In Cooperative Multitasking, tasks must voluntarily yield the CPU. If a task enters an infinite loop without yielding, the OS freezes. To solve this, we implemented Preemptive Multitasking. The Programmable Interval Timer (PIT) is hardwired to send an electrical interrupt (IRQ 0) to the CPU 100 times a second.
+x86 defines four privilege levels, called \textbf{Rings}, numbered 0--3. Ring 0 is the
+most privileged (the kernel); Ring 3 is the least privileged (user applications).
+The current privilege level (CPL) is stored in bits 0--1 of the CS segment register.
 
-\subsection{The IRET Stack Frame}
-When a hardware interrupt fires, the CPU automatically pushes the EFLAGS, Code Segment (CS), and Instruction Pointer (EIP) onto the stack. Therefore, the assembly handler must end with an \texttt{iret} (Interrupt Return) instruction to pop all three. We updated our \texttt{create\_task} C++ function to fake an IRET stack frame when creating new tasks.
+Hardware enforces this separation: an instruction like \texttt{cli} (disable interrupts)
+executed in Ring 3 immediately triggers a \#GP exception. This prevents a buggy or
+malicious application from disabling the timer interrupt and freezing the OS.
 
-\subsection{The Hardware Hijack}
-We injected the Context Switch logic directly into the \texttt{isr32} assembly block. 100 times a second, the CPU pauses the running task, jumps to \texttt{isr32}, saves the current task's Stack Pointer (ESP), overwrites the CPU's ESP with the next task's stack pointer, and calls \texttt{iret}. This forcefully teleports the CPU into the new task, entirely bypassing the C++ software flow, guaranteeing the OS never freezes.
+\subsection{The Task State Segment (TSS)}
 
-\section{Phase 16: The Virtual File System (VFS)}
-{\small\textit{\textbf{Completed:} August 27, 2026}}\par\medskip
-\subsection{The Core Problem}
-After building a multitasking kernel, the next fundamental challenge is giving the OS a concept of ``files.'' Without a file system, the OS has no way to load programs, read configuration, or store user data. However, we do not yet have a driver to communicate with a real hard drive. Writing an AHCI or NVMe driver from scratch is an enormous undertaking. We need a simpler approach to prove the concept first.
+When a hardware interrupt fires in Ring 3, the CPU must switch to the kernel stack
+(Ring 0 stack) to handle it securely. Otherwise, a user program could manipulate the
+interrupt handler by crafting a fake stack frame. The CPU finds the Ring 0 stack
+address by reading it from the \textbf{Task State Segment (TSS)}.
 
-\subsection{The Initial Ramdisk (initrd)}
-The solution is the \textbf{Initial Ramdisk}, or \texttt{initrd}. Before handing control to our C++ kernel, the GRUB bootloader is capable of loading additional binary blobs (``modules'') directly into the computer's physical RAM. We package a set of files into a standard \texttt{.tar} archive on the host machine, and tell GRUB to load that archive into memory. The result is a ``fake'' hard drive that lives entirely in RAM and is available from the very first instruction of our kernel. Linux itself still uses this exact mechanism today to load essential drivers during boot.
+The TSS is a special data structure (minimum 104 bytes) registered in the GDT under a
+\textbf{system descriptor} (S-bit = 0, type = \texttt{0x9}). The TSS descriptor selector
+is loaded into the \texttt{TR} (Task Register) via the \texttt{ltr} instruction. When a
+privilege transition occurs, the CPU automatically reads \texttt{ESP0} and \texttt{SS0}
+from the TSS to set up the kernel stack.
 
-\subsection{The Multiboot Information Structure}
-Once GRUB loads the \texttt{.tar} archive into RAM, our kernel needs to find it. GRUB solves this by writing a comprehensive ``Information Checklist'' into memory before booting us. This structure (defined by the Multiboot Specification) contains critical data including the total amount of physical RAM, the address of the VBE framebuffer, and crucially, the physical memory addresses of every loaded module (our RAM disk).
+\section{User Mode (Ring 3)}
 
-Just before jumping to our \texttt{\_start} label in \texttt{boot.asm}, GRUB places a pointer to this structure inside the CPU's \texttt{EBX} register.
+\subsection{Dropping Privileges}
 
-\subsection{Passing the Pointer (boot.asm)}
-Because our OS is a C++ program, we need to pass this pointer from the Assembly world into the C++ world. We achieve this with a single instruction added to \texttt{\_start}:
-\begin{lstlisting}[language={[x86masm]Assembler}]
-push ebx       ; Push the Multiboot struct pointer as a C++ function argument
-call kernel_main
+The CPU always starts in Ring 0. To run untrusted user code, we must artificially
+transfer execution to Ring 3. This is done by constructing a \textbf{fake interrupt
+return frame} on the stack and executing \texttt{iret}.
+
+When \texttt{iret} executes, it pops \texttt{EIP}, \texttt{CS}, \texttt{EFLAGS}, \texttt{ESP},
+and \texttt{SS} from the stack. If the \texttt{CS} selector's DPL is 3, the CPU
+transitions to Ring 3 and loads the user-mode stack from the popped \texttt{SS:ESP}.
+
+\begin{lstlisting}[language=C++, title=boot/usermode.asm -- Fake IRET frame for Ring 3]
+jump_usermode:
+    mov ax, 0x23    ; User data segment selector (GDT index 4, RPL=3)
+    mov ds, ax
+    push 0x23       ; SS
+    push user_stack ; ESP
+    pushf           ; EFLAGS (current flags, including IF=1)
+    push 0x1B       ; CS = user code segment (GDT index 3, RPL=3)
+    push user_main  ; EIP (entry point of user program)
+    iret            ; CPU drops to Ring 3!
 \end{lstlisting}
-This places the pointer on the stack exactly where the C++ calling convention expects to find the first argument to a function.
 
-\subsection{The Decoder Ring (multiboot.h)}
-Raw memory is just a stream of bytes. To make sense of it in C++, we define a struct (\texttt{kernel/multiboot.h}) whose fields perfectly align with the layout of the Multiboot Information Structure defined in the spec. The \texttt{\_\_attribute\_\_((packed))} directive tells the compiler to add zero padding between fields, ensuring an exact byte-for-byte match with the raw memory. The two key fields we care about are \texttt{mods\_count} (how many modules GRUB loaded) and \texttt{mods\_addr} (the memory address of the list of loaded modules). A second struct, \texttt{multiboot\_mod\_list}, describes each individual module with its \texttt{mod\_start} and \texttt{mod\_end} physical memory addresses.
+\section{System Calls: The Kernel--Userspace Bridge}
 
-\subsection{The VFS Interface (vfs.h)}
-The VFS is a universal adapter between the kernel and any underlying storage driver. The core concept is a single struct called \texttt{fs\_node} (analogous to a Unix \texttt{inode}) that represents any file on any file system. Critically, it contains a C++ \textbf{function pointer} named \texttt{read}:
+\subsection{The Fundamental Isolation Problem}
 
-\begin{lstlisting}[language=C++]
+Ring 3 code is physically incapable of accessing kernel services directly. A user
+program cannot write to VGA memory at \texttt{0xB8000} (mapped read-only for Ring 3),
+call kernel functions (different address space), or execute privileged instructions.
+
+Without a mechanism to cross this boundary, user programs are entirely useless.
+
+\subsection{The \texttt{int 0x80} ABI}
+
+The universal solution is the \textbf{system call}. A user program places arguments
+in CPU registers and triggers a predefined software interrupt. The CPU performs a
+\textit{controlled} privilege escalation: it validates the IDT gate's DPL (must be
+$\geq$ Ring 3 to be callable from Ring 3), switches to the kernel stack via the TSS,
+and jumps to the kernel's interrupt handler at Ring 0.
+
+The calling convention for Abyss system calls uses CPU registers to pass arguments
+(since the user and kernel stacks are separate and cannot easily share pointers
+across privilege boundaries):
+\begin{itemize}
+    \item \textbf{EAX}: System call number (1 = print string).
+    \item \textbf{EBX}: First argument (e.g., pointer to string in user memory).
+\end{itemize}
+
+The kernel handler inspects \texttt{EAX} to dispatch the correct service, performs
+the operation on behalf of the user program, and returns via \texttt{iret}.
+
+\section{The System Timer (PIT) and Preemptive Multitasking}
+
+\subsection{The Programmable Interval Timer}
+
+The \textbf{8253/8254 Programmable Interval Timer (PIT)} is a hardware chip that
+generates periodic interrupts at a configurable frequency. Its internal oscillator
+runs at exactly \textbf{1,193,182 Hz}. To achieve a tick rate of $f$ Hz, we program
+a divisor $d$:
+\[
+d = \left\lfloor \frac{1{,}193{,}182}{f} \right\rfloor
+\]
+For $f = 100$ Hz (100 ticks/second): $d = 11{,}931$.
+
+The divisor is written to the PIT's data port (\texttt{0x40}) in two 8-bit writes
+(low byte first, then high byte). The PIT is wired to IRQ 0, so it fires vector 32 100 times per second.
+
+\subsection{Multitasking Theory: The Illusion of Concurrency}
+
+A single-core CPU executes exactly one instruction at a time. \textbf{Multitasking}
+creates the \textit{illusion} of parallel execution by rapidly switching between tasks,
+each of which perceives it has sole ownership of the CPU.
+
+The OS maintains a \textbf{Task Control Block (TCB)} for each task, storing its complete
+CPU state (registers, stack pointer, instruction pointer) when it is descheduled.
+
+\textbf{Cooperative multitasking} requires tasks to voluntarily yield the CPU
+(\texttt{yield()} call). A single hung task freezes the entire system.
+
+\textbf{Preemptive multitasking} uses the PIT interrupt to forcibly switch tasks
+100 times per second, regardless of task behavior. The context switch happens inside
+the IRQ 0 handler:
+
+\begin{enumerate}
+    \item IRQ 0 fires. CPU pushes \texttt{EFLAGS}, \texttt{CS}, \texttt{EIP} onto the
+    \textit{current task's stack} (this is the hardware-assisted part of the state save).
+    \item The \texttt{isr32} handler pushes all general-purpose registers (\texttt{pusha}).
+    \item The current \texttt{ESP} is saved into the current TCB.
+    \item \texttt{ESP} is overwritten with the next task's saved \texttt{ESP} from its TCB.
+    \item Registers are restored from the new stack (\texttt{popa}).
+    \item \texttt{iret} executes, which pops the new task's \texttt{EIP}/\texttt{CS}/\texttt{EFLAGS}
+    and resumes it \textit{exactly where it was paused}.
+\end{enumerate}
+
+The power of this mechanism is that the context switch is entirely \textit{transparent}
+to the tasks --- they are never aware they were paused.
+
+\newpage
+
+\chapter{Virtual File System}
+
+\section{The Abstraction Problem}
+
+A fully functional OS must manage persistent data. However, there are dozens of
+incompatible storage formats: FAT32, ext4, NTFS, APFS, ZFS. If every application
+had to know the details of the underlying file system, porting an application from
+one OS to another would require rewriting all its storage code.
+
+The \textbf{Virtual File System (VFS)} is an abstraction layer that presents a
+unified API to applications, regardless of the underlying storage driver. The same
+\texttt{read()} call works whether the file lives on a FAT32 USB drive, an ext4
+hard drive, or in RAM.
+
+\section{The inode Model}
+
+The VFS models every storage object as a \textbf{node} (analogous to a Unix
+\texttt{inode} --- index node). Each node contains metadata about a file (name, size,
+type) plus a \textbf{function pointer} to the driver-specific read implementation:
+
+\begin{lstlisting}[language=C++, title=kernel/vfs.h]
 struct fs_node {
     char     name[128];
-    uint32_t flags;    // VFS_FILE or VFS_DIRECTORY
     uint32_t length;
-    uint32_t inode;
+    uint32_t flags;   // VFS_FILE or VFS_DIRECTORY
     uint32_t (*read)(fs_node*, uint32_t offset, uint32_t size, char* buf);
 };
 \end{lstlisting}
 
-The \texttt{vfs\_read()} wrapper function simply calls \texttt{node->read()} if it exists. This design means the kernel never needs to know which file system is underneath. A FAT32 file would store a \texttt{fat32\_read} pointer; a TarFS file stores a \texttt{tarfs\_read} pointer. The calling code is identical in both cases.
+The function pointer is the key to polymorphism in C. A FAT32 node's \texttt{read}
+pointer points to \texttt{fat32\_read()}; a TarFS node's points to \texttt{tarfs\_read()}.
+The kernel's generic \texttt{vfs\_read()} simply calls \texttt{node->read()} without
+knowing which driver is underneath.
 
-\subsection{The TarFS Driver (initrd.cpp)}
-The TarFS driver parses the raw \texttt{.tar} archive bytes that GRUB loaded into RAM. The ustar TAR format is elegantly simple: every file is preceded by a 512-byte \texttt{tar\_header} struct containing the filename and file size (stored as an \textbf{octal ASCII string}), followed by the file's raw content padded to the next 512-byte boundary.
+\section{The Initial Ramdisk (initrd)}
 
-The driver walks through memory block by block, converting each octal size string to an integer, building an \texttt{fs\_node} for each file, and wiring the \texttt{tarfs\_read} function pointer into the node. To find a file by name, \texttt{initrd\_findfile()} performs a linear scan through the node array using \texttt{strcmp}.
+Before a real disk driver exists, we need a way to provide initial files to the kernel.
+The solution is the \textbf{Initial Ramdisk}: a filesystem image that the bootloader
+loads entirely into RAM before handing control to the kernel.
 
-\subsection{Result}
-On boot, the kernel successfully called \texttt{initrd\_init()}, located \texttt{hello.txt} inside the in-memory TAR archive, and read its contents through the VFS layer. The message ``Greetings from the Abyss' Virtual file system, mortal!!'' was printed directly from raw RAM, proving that the entire VFS stack functions correctly end-to-end.
+GRUB supports loading \textit{modules} (binary blobs) into RAM and passing their
+physical addresses to the kernel via the Multiboot Information Structure
+(\texttt{mods\_addr} field). We package files into a \textbf{ustar TAR archive}
+and instruct GRUB to load it as a module.
 
-\section{Phase 17: The GUI (VESA Primitives \& Fonts)}
-{\small\textit{\textbf{Completed:} August 28, 2026}}\par\medskip
+\subsection{The ustar TAR Format}
 
-\subsection{Understanding VESA, VBE, and the LFB}
-Up until this phase, Abyss OS communicated visually using \textbf{VGA Text Mode}. The video card was hardwired to divide the screen into an 80x25 grid, and the kernel simply wrote ASCII character codes into a specific memory region (\texttt{0xB8000}). The physical graphics hardware did the actual work of drawing the shapes of the letters onto the monitor. While extremely fast and simple, this prevented us from drawing anything other than standard ASCII characters. 
-
-To build a graphical user interface (GUI) with windows, shapes, and custom colors, we needed absolute pixel-level control. To achieve this, we utilized the \textbf{VESA BIOS Extensions (VBE)}.
+The TAR format is elegantly simple. A TAR archive is a flat sequence of 512-byte
+\textit{blocks}. Each file is preceded by a \textbf{512-byte header block} containing:
 \begin{itemize}
-    \item \textbf{VESA} (Video Electronics Standards Association): An international consortium that standardizes computer video displays. 
-    \item \textbf{VBE} (VESA BIOS Extensions): A standard interface that allows an operating system to query the graphics card for available high-resolution modes (e.g., $1024 \times 768$ with 32-bit color) and switch into them during the boot process.
-    \item \textbf{LFB} (Linear Framebuffer): Once VBE switches the monitor into graphics mode, it disables the old text memory at \texttt{0xB8000}. Instead, it provides a \textbf{Linear Framebuffer}---a massive, contiguous block of physical RAM (often high up in the address space, e.g., \texttt{0xFD000000}) where every 32-bit chunk of memory directly corresponds to a single pixel on the screen. 
+    \item \textbf{filename[100]}: The file name (null-terminated).
+    \item \textbf{filesize[12]}: The file size in \textit{octal ASCII} (e.g.,
+    \texttt{"00000000017"} for 15 bytes). Storing the size in octal ASCII is a
+    historical quirk: early UNIX ran on PDP machines that natively used octal.
+    \item \textbf{magic[6]}: \texttt{"ustar"} for compliance validation.
 \end{itemize}
+Following the header, the raw file data occupies the next $\lceil size/512 \rceil$
+blocks, zero-padded to a 512-byte boundary.
 
-By configuring the GRUB bootloader to enable VBE via the Multiboot specification (\texttt{FLAGS = 0x04}), GRUB sets up the LFB for us. The kernel's job is simply to map that physical LFB address into its Virtual Memory using Paging (we used 4MB ``Big Pages'' to map the entire 4GB space quickly), and then write raw color hex codes directly into that memory to manipulate pixels.
-\subsection{Beyond the Pixel}
-While configuring the VBE framebuffer and writing a \texttt{put\_pixel} and \texttt{draw\_rect} function provided a graphical canvas, a modern OS requires much more sophisticated drawing primitives to build an aesthetically pleasing user interface. We opted for a deep crimson and purple ``Abyss'' theme, requiring gradients, circles, lines, and custom text rendering.
+The TarFS driver walks through these blocks in memory, builds an \texttt{fs\_node}
+for each file, and wires the function pointer to \texttt{tarfs\_read}, which simply
+copies bytes from the in-RAM location.
 
-\subsection{Linear Interpolation (Gradients)}
-To create a premium UI, we implemented \texttt{draw\_gradient\_rect}. Instead of filling a rectangle with a solid color, this algorithm fades smoothly from a start color (top) to an end color (bottom). This is accomplished via \textbf{Linear Interpolation (Lerp)}. For each row, the specific R, G, and B components are calculated proportionally based on the row's percentage down the screen:
-\begin{lstlisting}[language=C++]
-uint8_t r = r1 + (((int)r2 - (int)r1) * (int)i) / (int)h;
-\end{lstlisting}
+\newpage
 
-\subsection{Bresenham's Line Algorithm}
-Drawing a perfectly horizontal or vertical line is trivial using a \texttt{for} loop. However, drawing a diagonal line pixel-by-pixel is mathematically complex because you must determine which exact pixels on the grid best approximate the mathematical slope. To solve this without using extremely slow floating-point decimal math or division, we implemented \textbf{Bresenham's Line Algorithm}, an ingenious logic flow that relies purely on fast integer addition, subtraction, and error tracking to step along the line.
+\chapter{Graphics \& Graphical User Interface}
 
-\subsection{The Midpoint Circle Algorithm}
-To draw rounded UI elements (like status orbs), we implemented the \textbf{Midpoint Circle Algorithm} (specifically, a highly optimized variant known as Jesko's Method). Because a perfect circle is completely symmetrical across 8 separate octants, the algorithm only has to calculate the outer pixels for one-eighth of the circle (a 45-degree slice). For every pixel it calculates, it immediately plots 8 perfectly mirrored pixels in all directions, dramatically reducing CPU overhead. 
+\section{VESA, VBE, and the Linear Framebuffer}
 
-To create a \texttt{fill\_circle} function, we simply replaced the 8 \texttt{put\_pixel} calls with 4 horizontal \texttt{draw\_line} calls connecting the mirrored left and right edges.
+\subsection{Beyond Text Mode}
 
-\subsection{Bitmap Text Rendering}
-When we switched from VGA Text Mode to VESA Graphics Mode, we lost our interactive shell, as the physical GPU hardware stopped rendering ASCII characters from memory address \texttt{0xB8000}. To get text back, we built a \textbf{Bitmap Font Renderer}.
+VGA Text Mode's character-grid paradigm is fundamentally incapable of rendering
+arbitrary graphics. A pixel-level graphical display requires a different model:
+the \textbf{Linear Framebuffer (LFB)}.
 
-We imported a standard 8x8 font (\texttt{font8x8\_basic.h}), which is a large array containing every ASCII character represented as an $8 \times 8$ grid of binary bits (where \texttt{1} means draw a pixel, and \texttt{0} means leave it blank). To draw a character, the kernel looks up the character in the array, loops through the $8 \times 8$ grid, and uses bitwise operations to check each pixel:
-\begin{lstlisting}[language=C++]
-if ((glyph[row] >> col) & 1) {
-    draw_rect(x + (col * scale), y + (row * scale), scale, scale, fg_color);
+\textbf{VESA BIOS Extensions (VBE)} is a standard API (originally implemented in
+BIOS firmware, later superseded by UEFI GOP) that allows software to query the
+GPU for available video modes and switch into one. In Multiboot mode, we request a
+video mode via the Multiboot header flags, and GRUB configures VBE on our behalf
+before booting the kernel.
+
+\subsection{The Linear Framebuffer Model}
+
+In a linear framebuffer, the GPU exposes its video RAM as a contiguous array of
+pixels in the CPU's physical address space. In \texttt{1024$\times$768} with 32-bit
+color, the framebuffer is:
+\[
+1024 \times 768 \times 4 \text{ bytes} = 3{,}145{,}728 \text{ bytes} \approx 3 \text{ MB}
+\]
+
+The address of pixel $(x, y)$ is:
+\[
+\text{addr} = \text{fb\_base} + y \times \text{pitch} + x \times 4
+\]
+
+where \textbf{pitch} (or stride) is the number of bytes per row. Pitch may be larger
+than $\text{width} \times 4$ if the GPU pads rows for alignment.
+
+Each 32-bit pixel encodes color as \texttt{0x00RRGGBB}: one byte each for red, green,
+and blue components, with the top byte unused (or used for alpha transparency in some
+modes).
+
+\section{Double Buffering}
+
+\subsection{The Tearing Problem}
+
+If we draw directly to the framebuffer (which the display hardware is simultaneously
+reading to refresh the screen), we risk a visual artifact called \textbf{screen tearing}:
+the monitor displays the top half of the old frame and the bottom half of the new frame
+simultaneously, producing a horizontal seam.
+
+More critically, drawing a complex scene takes time. If the cursor is drawn before the
+background is cleared, intermediate states become visible, causing flicker.
+
+\subsection{The Double-Buffer Solution}
+
+\textbf{Double buffering} introduces a second, identical-sized memory region called the
+\textbf{back buffer}. All rendering operations target the back buffer exclusively. When
+the entire scene is finished, the contents of the back buffer are copied to the
+\textbf{front buffer} (the actual framebuffer) in a single, fast operation:
+
+\begin{lstlisting}[language=C++, title=kernel/vesa.cpp]
+void vesa_swap_buffers() {
+    // Copy 3MB of backbuffer to framebuffer in one blast
+    uint32_t dwords = (fb_width * fb_height);
+    asm volatile (
+        "rep movsl"
+        : "+S"(backbuffer), "+D"(framebuffer), "+c"(dwords)
+        : : "memory"
+    );
 }
 \end{lstlisting}
-By replacing a single \texttt{put\_pixel} call with a \texttt{draw\_rect} call, we added a \texttt{scale} parameter, allowing us to stretch the microscopic 8x8 font into 16x16 or 24x24 text so it is actually legible on a modern $1024 \times 768$ display. Finally, we updated our \texttt{draw\_string} loop to automatically handle newline characters (\texttt{\textbackslash n}) by resetting the X-coordinate and dropping the Y-coordinate.
 
-\subsection{Practical Applications of Primitives}
-With these drawing functions implemented, we transitioned from basic pixel manipulation to having the foundation for a complete Window Manager (GUI):
+The \texttt{rep movsl} assembly instruction copies \texttt{ECX} double-words (4-byte
+chunks) from \texttt{ESI} to \texttt{EDI} at maximum CPU throughput. Copying 3MB this
+way is orders of magnitude faster than a C++ loop, as the CPU can use internal
+write-combining buffers.
+
+\section{Rasterization Algorithms}
+
+\subsection{Linear Interpolation for Gradients}
+
+A gradient smoothly transitions between two colors. For a vertical gradient between
+color $c_1$ (top) and $c_2$ (bottom), row $i$ out of $h$ total rows receives the
+interpolated color computed independently for each channel:
+\[
+R_i = R_1 + \frac{(R_2 - R_1) \cdot i}{h}, \quad G_i = G_1 + \frac{(G_2 - G_1) \cdot i}{h}, \quad B_i = B_1 + \frac{(B_2 - B_1) \cdot i}{h}
+\]
+
+This is \textbf{linear interpolation (lerp)}, the simplest form of color blending.
+The division is integer division (no floating point required), performed using the
+full-precision intermediate value before truncation.
+
+\subsection{Bresenham's Line Algorithm}
+
+Drawing a line between two arbitrary points requires determining which pixels best
+approximate the mathematical line. Floating-point math (slope, $y = mx + b$) is too
+slow for per-pixel computation in a kernel.
+
+\textbf{Bresenham's algorithm} (1962) uses only integer arithmetic. It maintains an
+\textbf{error accumulator} $e$ that tracks the deviation of the rasterized line from
+the ideal. At each step, the error is compared to the slope to decide whether to
+advance both $x$ and $y$, or only $x$:
+
+\begin{lstlisting}[language=C++]
+int dx = abs(x1 - x0), dy = abs(y1 - y0);
+int err = dx + dy;
+while (true) {
+    put_pixel(x0, y0, color);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+}
+\end{lstlisting}
+
+\subsection{Midpoint Circle Algorithm}
+
+A circle of radius $r$ satisfies $x^2 + y^2 = r^2$. The \textbf{midpoint circle
+algorithm} exploits the circle's 8-fold symmetry: computing one octant (45 degrees)
+yields all 8 symmetric points simultaneously. It also avoids square roots by
+maintaining an integer \textbf{decision variable} $d$ initialized to $3 - 2r$. At
+each step, $d$ determines whether to move to the next row, and the decision variable
+is updated with only additions and subtractions.
+
+\subsection{Bitmap Font Rendering}
+
+Switching to VESA graphics mode disables the VGA hardware character generator.
+Text must be rendered manually using a \textbf{bitmap font}: a lookup table where
+each character is represented as an $8 \times 8$ grid of binary pixels.
+
+For character ASCII code $c$ and glyph row $r$, the 8-bit value \texttt{font[c][r]}
+encodes which of the 8 pixels in that row should be drawn. Pixel $p$ (0--7) is
+extracted with a bitwise shift and mask:
+\[
+\text{draw pixel}(p, r) \iff \left(\texttt{font}[c][r] \gg p\right) \mathbin{\&} 1 = 1
+\]
+
+By replacing \texttt{put\_pixel} with \texttt{draw\_rect(x, y, scale, scale)}, the
+kernel can scale the $8 \times 8$ bitmap to any integer multiple (e.g., $\times 2$
+for $16 \times 16$ text) without a separate font atlas for each size.
+
+\section{The PS/2 Mouse: Hardware Protocol}
+
+\subsection{The PS/2 Controller (Intel 8042)}
+
+The PS/2 keyboard and mouse share a legacy controller chip (the Intel 8042 or
+compatible) with two channels:
 \begin{itemize}
-    \item \textbf{Gradients:} Used for desktop backgrounds and premium window title bars to simulate depth.
-    \item \textbf{Lines:} Used to draw window borders, separators, and eventually wireframe 3D graphics or charts.
-    \item \textbf{Rectangles:} The core building block of the UI, used for window backgrounds, sidebars, and input fields.
-    \item \textbf{Circles:} Used for close/minimize/maximize window control buttons (similar to macOS), status indicator orbs, and rounded avatars.
-    \item \textbf{Bitmap Fonts:} Replaces the lost VGA hardware text mode, allowing us to render our command-line shell directly onto the graphical canvas and display file contents from the VFS.
+    \item \textbf{Primary port} (I/O port \texttt{0x60}/\texttt{0x64}): Keyboard.
+    \item \textbf{Auxiliary port}: Mouse. Must be explicitly enabled by setting bit 1
+    of the controller's configuration byte.
 \end{itemize}
 
-\section{Phase 18: The Graphical Terminal}
-{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
-\subsection{Reviving the Shell}
-While the VESA graphics engine provided a canvas for shapes and fonts, the operating system's core text output---including the interactive shell, keyboard input, and system logs---was completely disconnected. The legacy \texttt{vga.cpp} driver was still blindly writing ASCII characters into the physical memory address \texttt{0xB8000}, which the GPU was completely ignoring in graphics mode. 
+\subsection{The 3-Byte Packet Format}
 
-Instead of rewriting every single print statement across the entire OS, we performed a surgical refactor of \texttt{kernel/vga.cpp}. We removed the \texttt{0xB8000} memory pointer entirely and replaced it with global graphical coordinates (\texttt{term\_x} and \texttt{term\_y}). 
+The PS/2 mouse transmits movement data in 3-byte packets, one byte per IRQ 12 firing.
+A state machine in the handler assembles the packet:
 
-\subsection{Graphical Print Logic}
-We updated \texttt{vga\_print\_char} to act as a graphical terminal emulator using our new bitmap font renderer.
-\begin{itemize}
-    \item \textbf{Newline (\texttt{\textbackslash n}):} Resets \texttt{term\_x} to the left margin and increases \texttt{term\_y} by the scaled font height.
-    \item \textbf{Backspace (\texttt{\textbackslash b}):} Decrements \texttt{term\_x}, then draws a solid black rectangle over the previous coordinates to visually ``erase'' the character.
-    \item \textbf{Standard Characters:} Calls \texttt{draw\_char} to render the pixels, then increments \texttt{term\_x} to move the cursor to the right.
-\end{itemize}
+\begin{center}
+\begin{tabular}{|c|c|c|}
+\hline
+\textbf{Byte} & \textbf{Bits} & \textbf{Meaning} \\
+\hline
+0 & [0] & Left button pressed \\
+0 & [1] & Right button pressed \\
+0 & [3] & Synchronization bit (always 1 in valid packets) \\
+0 & [4] & X sign bit (extends X delta to 9-bit signed) \\
+0 & [5] & Y sign bit (extends Y delta to 9-bit signed) \\
+1 & [7:0] & X movement delta (8-bit, sign-extended using byte 0 bit 4) \\
+2 & [7:0] & Y movement delta (inverted: positive = down in hardware coords) \\
+\hline
+\end{tabular}
+\end{center}
 
-\subsection{Screen Paging}
-In VGA text mode, scrolling the screen simply meant shifting a 4KB array backwards. In VESA graphics mode, shifting millions of pixels is computationally expensive without hardware acceleration. To handle the cursor reaching the bottom of the screen, we implemented a simple ``pager'' mechanism. When \texttt{term\_y} exceeds the maximum vertical resolution, \texttt{vga\_clear()} is triggered, which draws a massive black rectangle over the entire terminal bounds and resets the cursor coordinates back to the top left.
+The Y-axis inversion is critical: the PS/2 protocol uses a coordinate system where
+positive Y is upward, while screen coordinates have positive Y downward. The driver
+must subtract (not add) the Y delta from the cursor's screen Y coordinate.
 
-\section{Phase 19: The PS/2 Mouse Driver}
-{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
-\subsection{Hardware Initialization}
-To make Abyss OS truly interactive, we implemented a bare-metal driver for the PS/2 auxiliary device (the mouse). The PS/2 controller (Intel 8042 chip) requires a very specific initialization sequence sent to Port \texttt{0x64} (Command) and Port \texttt{0x60} (Data). We enabled the auxiliary port (\texttt{0xA8}), modified the configuration byte to enable IRQ 12, told the mouse to use default settings (\texttt{0xF6}), and finally enabled data reporting (\texttt{0xF4}).
+\section{Window Management and the Compositor}
 
-\subsection{The 3-Byte Packet State Machine}
-Unlike the keyboard which sends single scancodes, the PS/2 mouse transmits a 3-byte packet every time it moves. We hooked IRQ 12 (Interrupt 44) directly to our \texttt{isr44\_handler} in \texttt{mouse.cpp}. The handler acts as a state machine:
-\begin{itemize}
-    \item \textbf{Byte 0:} Contains sign bits and button states. (We also use Bit 3 to enforce synchronization).
-    \item \textbf{Byte 1:} The X-axis delta (movement left/right).
-    \item \textbf{Byte 2:} The Y-axis delta (movement up/down).
-\end{itemize}
-Because the PS/2 Y-axis is inverted relative to standard screen coordinates, we subtract the Y-delta from our global \texttt{mouse\_y} variable while adding the X-delta to \texttt{mouse\_x}.
+\subsection{The Compositor Pattern}
 
-\subsection{Non-Destructive Cursor Rendering}
-A naive implementation of a cursor simply draws pixels at the mouse coordinates, which leaves a permanent ``smeared'' trail across the screen, destroying text and UI elements. 
-To build a professional, non-destructive pointer (a 10x15 pixel classic arrow), our interrupt handler executes a precise sequence on every movement:
+A \textbf{compositor} is the subsystem responsible for assembling the final scene from
+multiple independently-rendered layers and presenting it on screen. In Abyss OS, the
+\texttt{ui\_render()} function acts as a simple compositor:
+
 \begin{enumerate}
-    \item \textbf{Restore:} Repaint the original background pixels over the \textit{old} cursor coordinates using a saved buffer.
-    \item \textbf{Save:} Read the new background pixels at the \textit{new} coordinates using \texttt{get\_pixel()} and save them to the buffer.
-    \item \textbf{Draw:} Draw the pointer bitmap at the new coordinates.
+    \item \textbf{Clear}: Render the desktop background gradient to the back buffer.
+    \item \textbf{Paint Windows}: Iterate through the window array (back-to-front,
+    respecting Z-order) and render each window's chrome (title bar, borders, body)
+    plus its application-specific content.
+    \item \textbf{Draw Cursor}: Render the mouse cursor on top of all windows.
+    \item \textbf{Swap}: Atomically copy the back buffer to the front buffer.
 \end{enumerate}
 
+\subsection{Z-Order and Window Focus}
+
+The \textbf{Z-order} determines which window appears on top when windows overlap.
+In Abyss, the \texttt{windows[]} array is ordered back-to-front: the last element
+is always rendered on top. When the user clicks a window, it is \textit{promoted}:
+removed from its current position, and appended to the end of the array using a
+shift operation, ensuring it is rendered over all other windows.
+
+\subsection{Click Detection and Drag Mechanics}
+
+Drag detection requires distinguishing between a fresh click and a held button.
+The key insight is: a drag should only \textit{begin} on the exact frame where
+\texttt{mouse\_left\_pressed} transitions from \texttt{false} to \texttt{true}.
+This is tracked by comparing the current state against \texttt{prev\_mouse\_left\_pressed},
+a boolean updated at the end of each frame.
+
+A window is \textit{draggable} only if the click started within its title bar. During
+a drag, the window's position is updated to:
+\[
+\text{window.x} = \text{mouse.x} - \text{drag\_offset\_x}
+\]
+where \texttt{drag\_offset\_x} was recorded as the distance between the cursor and the
+window's top-left corner \textit{at the moment the drag began}, ensuring the window
+does not snap its origin to the cursor.
+
+\newpage
+
+\chapter{Storage \& FAT32 File System}
+
+\section{ATA and Disk I/O Theory}
+
+\subsection{The Physical Hard Drive}
+
+A \textbf{Hard Disk Drive (HDD)} stores data by magnetically encoding bits onto
+rotating metallic platters. Data is organized into concentric \textbf{tracks}; each
+track is divided into \textbf{sectors} of 512 bytes. A \textbf{read/write head}
+floats nanometers above the platter surface on an actuator arm, reading or writing
+bits as the platter spins beneath it.
+
+\textbf{Seek time} (time to position the head over the correct track) and
+\textbf{rotational latency} (time to wait for the target sector to rotate under the
+head) are the two dominant sources of latency for HDD reads, typically totaling
+5--15 ms --- approximately 10,000,000 CPU cycles at 1 GHz.
+
+\subsection{Logical Block Addressing (LBA)}
+
+Early BIOSes addressed disk sectors using the physical \textbf{CHS (Cylinder-Head-Sector)}
+coordinate system. This required the OS to know the physical geometry of each drive ---
+an impractical dependency as drives evolved.
+
+\textbf{Logical Block Addressing (LBA)} abstracts the disk into a flat, zero-indexed
+array of 512-byte blocks. LBA28 uses a 28-bit address, supporting:
+\[
+2^{28} \times 512 = 137{,}438{,}953{,}472 \text{ bytes} = 128 \text{ GB}
+\]
+
+\subsection{ATA PIO Mode}
+
+\textbf{ATA (Advanced Technology Attachment)} defines the electrical and logical
+interface between the motherboard and storage devices. The legacy \textbf{PIO
+(Programmed I/O)} mode transfers data by having the CPU manually execute I/O
+instructions for every word of data. While slower than DMA (Direct Memory Access),
+PIO is the simplest baseline and requires no additional hardware support.
+
+The ATA controller lives at I/O ports \texttt{0x1F0}--\texttt{0x1F7} (primary bus):
+
+\begin{center}
+\begin{tabular}{|c|c|}
+\hline
+\textbf{Port} & \textbf{Purpose} \\
+\hline
+\texttt{0x1F0} & Data register (16-bit, read/write 1 sector = 256 words) \\
+\texttt{0x1F1} & Error register (read) / Features (write) \\
+\texttt{0x1F2} & Sector count \\
+\texttt{0x1F3} & LBA bits 0--7 \\
+\texttt{0x1F4} & LBA bits 8--15 \\
+\texttt{0x1F5} & LBA bits 16--23 \\
+\texttt{0x1F6} & Drive select + LBA bits 24--27 \\
+\texttt{0x1F7} & Status (read) / Command (write) \\
+\hline
+\end{tabular}
+\end{center}
+
+A read sequence:
+\begin{enumerate}
+    \item Write LBA address across ports \texttt{0x1F3}--\texttt{0x1F6}.
+    \item Write command \texttt{0x20} (READ SECTORS) to \texttt{0x1F7}.
+    \item \textbf{Poll} status port \texttt{0x1F7}: wait until \textbf{BSY} (bit 7)
+    clears and \textbf{DRQ} (bit 3, Data Request) sets.
+    \item Execute \texttt{rep insw} to read 256 16-bit words from port \texttt{0x1F0}
+    into the buffer.
+\end{enumerate}
+
+\section{The FAT32 File System}
+
+\subsection{Volume Layout}
+
+A FAT32-formatted disk is divided into four regions:
+
+\begin{center}
+\begin{tabular}{|c|c|c|}
+\hline
+\textbf{Region} & \textbf{Size} & \textbf{Purpose} \\
+\hline
+VBR (Sector 0) & 1 sector & Volume metadata (BPB) \\
+Reserved Sectors & Variable & GRUB, FSInfo, backup boot sector \\
+FAT Table(s) & Variable & Cluster allocation linked list \\
+Data Region & Remainder & Actual file and directory content \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{The Volume Boot Record and BIOS Parameter Block}
+
+The \textbf{Volume Boot Record (VBR)}, also called the Partition Boot Record, occupies
+the first 512 bytes of the partition. It contains the \textbf{BIOS Parameter Block (BPB)},
+a structured header describing the file system geometry.
+
+Key BPB fields relevant to our implementation:
+\begin{itemize}
+    \item \textbf{bytes\_per\_sector} (offset 11): Almost always 512.
+    \item \textbf{sectors\_per\_cluster} (offset 13): Power of 2 (1, 2, 4, ..., 128).
+    Larger values reduce FAT table size but increase internal fragmentation.
+    \item \textbf{reserved\_sectors} (offset 14): Number of sectors before the FAT
+    (where the VBR lives). Typically 32 for FAT32.
+    \item \textbf{fat\_count} (offset 16): Number of FAT copies (usually 2 for redundancy).
+    \item \textbf{sectors\_per\_fat} (offset 36): Size of one FAT table in sectors.
+    \item \textbf{root\_cluster} (offset 44): Cluster number of the Root Directory.
+\end{itemize}
+
+From these values, the LBA of any region can be computed:
+\[
+\text{fat\_lba} = \text{reserved\_sectors}
+\]
+\[
+\text{data\_lba} = \text{fat\_lba} + (\text{fat\_count} \times \text{sectors\_per\_fat})
+\]
+\[
+\text{cluster\_lba}(n) = \text{data\_lba} + (n - 2) \times \text{sectors\_per\_cluster}
+\]
+
+The $-2$ offset is because FAT32 cluster numbering starts at 2 (clusters 0 and 1
+are reserved for special markers).
+
+\subsection{The File Allocation Table}
+
+The \textbf{File Allocation Table} is an array of 32-bit unsigned integers (28 bits
+used, top 4 reserved). Each entry corresponds to a cluster in the Data Region:
+\begin{itemize}
+    \item \texttt{0x00000000}: Cluster is free.
+    \item \texttt{0x00000002}--\texttt{0x0FFFFFEF}: Next cluster in the file's chain.
+    \item \texttt{0x0FFFFFF8}--\texttt{0x0FFFFFFF}: End-of-File (EOF) marker.
+    \item \texttt{0x0FFFFFF7}: Bad cluster (hardware defect, skip).
+\end{itemize}
+
+Files are stored in a \textbf{singly-linked list of clusters}. To read a file starting
+at cluster $C_0$, the driver follows the chain: $C_0 \to \text{FAT}[C_0] \to \text{FAT}[\text{FAT}[C_0]] \to \ldots \to \text{EOF}$.
+
+To look up entry $C$ in the FAT, the driver must:
+\begin{enumerate}
+    \item Compute the FAT sector: $\text{fat\_sector} = \text{fat\_lba} + \lfloor C / 128 \rfloor$ (since $512/4 = 128$ entries per sector).
+    \item Compute the byte offset within that sector: $\text{offset} = (C \bmod 128) \times 4$.
+    \item Read the sector via ATA, extract the 4 bytes at the offset, mask with
+    \texttt{0x0FFFFFFF}.
+\end{enumerate}
+
+\subsection{Directory Entries}
+
+Directories in FAT32 are just files whose content is an array of \textbf{32-byte
+directory entries}. Each entry describes one file or subdirectory:
+
+\begin{center}
+\begin{tabular}{|c|c|c|}
+\hline
+\textbf{Offset} & \textbf{Size} & \textbf{Field} \\
+\hline
+0   & 8 bytes & Short filename (space-padded, uppercase) \\
+8   & 3 bytes & Extension (space-padded, uppercase) \\
+11  & 1 byte  & Attributes bitmask \\
+20  & 2 bytes & First cluster high word \\
+26  & 2 bytes & First cluster low word \\
+28  & 4 bytes & File size in bytes \\
+\hline
+\end{tabular}
+\end{center}
+
+The \textbf{attributes byte} is a bitmask:
+\begin{itemize}
+    \item \texttt{0x01}: Read-only.
+    \item \texttt{0x02}: Hidden.
+    \item \texttt{0x04}: System file.
+    \item \texttt{0x08}: Volume label (not a real file --- skip it).
+    \item \texttt{0x10}: Directory.
+    \item \texttt{0x0F}: Long File Name entry (skip; handled by LFN subsystem).
+\end{itemize}
+
+A special first-byte value of \texttt{0xE5} marks a \textit{deleted} entry
+(the disk space is free but the content is not yet overwritten). A value of
+\texttt{0x00} indicates that this entry and all subsequent entries in the directory
+are empty --- the traversal can stop.
+
+\subsection{Structure Alignment: \texttt{pragma pack}}
+
+C++ compilers insert \textbf{padding bytes} between struct fields to align them on
+natural boundaries (e.g., a 4-byte \texttt{uint32\_t} is placed at a 4-byte-aligned
+offset). This optimization improves CPU memory access speed but means a C++ struct
+may not match the physical byte layout on disk.
+
+For example, without packing, a struct with a \texttt{char} followed by a
+\texttt{uint32\_t} would have 3 invisible padding bytes between them, shifting all
+subsequent fields by 3 bytes and producing garbage when cast from raw disk data.
+
+\texttt{\#pragma pack(push, 1)} instructs the compiler to use 1-byte alignment
+(no padding) for all subsequent structs. After the FAT32 structs, \texttt{\#pragma pack(pop)}
+restores the default alignment. This ensures the C++ struct is a perfect byte-for-byte
+mirror of the on-disk layout.
+
+\newpage
+
+\chapter{Interactive File Reading}
+
+\section{Traversing the Full Root Directory}
+
+\subsection{The Single-Sector Limitation}
+
+The initial implementation of \texttt{fat32\_get\_root\_entries()} read only the first
+sector of the root directory cluster. Since each 32-byte directory entry occupies one
+slot in the 512-byte sector, the first sector contains exactly 16 entries. With Long
+File Name (LFN) entries consuming additional slots (one LFN entry per 13 characters
+of the long name), the effective limit on visible files was even lower.
+
+The correct implementation must traverse the root directory's entire cluster chain,
+just as \texttt{fat32\_read\_file()} traverses a regular file's chain:
+
+\begin{lstlisting}[language=C++, title=kernel/fat32.cpp]
+int fat32_get_root_entries(FAT32_DirectoryEntry* out_buffer, int max_entries) {
+    uint32_t current_cluster = root_dir_cluster;
+    int found_count = 0;
+    while (current_cluster < 0x0FFFFFF8) {
+        uint32_t lba = cluster_to_lba(current_cluster);
+        for (int s = 0; s < sectors_per_cluster; s++) {
+            uint8_t buf[512];
+            ata_read_sector(lba + s, buf);
+            FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)buf;
+            for (int i = 0; i < 16; i++) {
+                if (entries[i].name[0] == 0x00) return found_count;
+                if ((uint8_t)entries[i].name[0] == 0xE5) continue;
+                if (entries[i].attributes == 0x0F ||
+                    (entries[i].attributes & 0x08)) continue;
+                if (found_count < max_entries)
+                    out_buffer[found_count++] = entries[i];
+            }
+        }
+        current_cluster = fat32_get_next_cluster(current_cluster);
+    }
+    return found_count;
+}
+\end{lstlisting}
+
+\section{Static Caching in the GUI}
+
+Reading from the ATA controller is expensive: each sector read requires a polling loop
+(busy-waiting on the BSY and DRQ status bits) that may stall the CPU for millions of
+cycles. If \texttt{fat32\_get\_root\_entries()} were called on every frame of the GUI
+render loop (typically 30--60 times per second), the system would spend the majority of
+its time waiting on disk I/O, making window dragging jerky and unresponsive.
+
+The solution is a \textbf{static cache}. In C++, a \texttt{static} local variable is
+initialized only once and persists between function calls. Using a sentinel value
+(\texttt{-1}) to indicate ``not yet loaded'', the file list is read from disk exactly
+once and stored in a static buffer for all subsequent frames:
+
+\begin{lstlisting}[language=C++]
+static FAT32_DirectoryEntry files[16];
+static int file_count = -1;
+if (file_count == -1)
+    file_count = fat32_get_root_entries(files, 16);
+\end{lstlisting}
+
+\section{Event-Driven Click Detection}
+
+\subsection{The Hit-Test Problem}
+
+Determining whether a mouse click landed on a specific UI element is called a
+\textbf{hit test}. For rectangular elements (which all our file entries are), the
+hit test is an axis-aligned bounding-box intersection:
+\[
+\text{hit} \iff x_{mouse} \in [x_{elem},\ x_{elem} + w_{elem}] \;\wedge\; y_{mouse} \in [y_{elem},\ y_{elem} + h_{elem}]
+\]
+
+Since each file entry is rendered at a dynamically computed Y position
+(\texttt{file\_y} is incremented by 24 pixels per entry), the hit test must be
+evaluated \textit{inside the rendering loop}, where \texttt{file\_y} has the correct
+value for the current entry.
+
+\subsection{Edge Detection for Mouse Clicks}
+
+A naive implementation using \texttt{if (mouse\_left\_pressed)} would trigger
+continuously for every frame the button is held. This would cause a single click on a
+file to load it dozens of times and fire spuriously as the user drags the mouse across
+files.
+
+The correct approach is \textbf{rising-edge detection}: we only act on the first frame
+where the button transitions from \textit{not pressed} to \textit{pressed}. This is
+implemented by storing the previous frame's button state:
+\[
+\text{click} \iff \texttt{mouse\_left\_pressed} \wedge \neg\texttt{prev\_mouse\_left\_pressed}
+\]
+
+The previous state is updated at the end of every frame.
+
+\section{Window Visibility and the Application Launch Model}
+
+\subsection{Visibility as State}
+
+A \textbf{visibility flag} on the \texttt{Window} struct allows windows to be
+pre-allocated but hidden. This avoids the overhead of dynamic memory allocation for
+window creation and simplifies the window management logic.
+
+The Notepad window is pre-allocated with \texttt{visible = false}. When the user clicks
+a file in the File Explorer, the OS:
+\begin{enumerate}
+    \item Reads the file's cluster chain from the FAT32 hard drive into a shared static buffer.
+    \item Sets the Notepad window's \texttt{visible} flag to \texttt{true}.
+    \item Sets \texttt{needs\_redraw = true} to force a compositor refresh.
+\end{enumerate}
+
+On the next frame, the compositor detects the visible Notepad window, renders its
+white interior, and calls \texttt{draw\_string} with the shared buffer to rasterize
+the file's text content.
+
+\begin{lstlisting}[language=C++, title=kernel/ui.cpp -- Notepad rendering]
+// Is this the Notepad window?
+if (w->title[0] == 'N' && w->title[1] == 'o') {
+    draw_rect(w->x+2, w->y+24, w->width-4, w->height-26, 0xFFFFFF);
+    draw_string(notepad_text, w->x+10, w->y+30, 0x000000, 0xFFFFFF, 1);
+}
+\end{lstlisting}
+
+\newpage
+
+
+\chapter{Executable Programs \& The Loader API}
+
+A defining characteristic of an operating system is its ability to load and execute standalone programs stored on secondary storage. In Abyss OS, this mechanism bridges the FAT32 file system, the graphical user interface, and the physical CPU execution pipeline.
+
+\section{The Flat Binary Format}
+Executable files typically rely on structured formats such as ELF (Executable and Linkable Format) or PE (Portable Executable), which contain complex headers, symbol tables, and relocation data. While these formats offer flexibility, they introduce significant parsing complexity.
+
+For its initial implementation, Abyss OS utilizes the \textbf{Flat Binary} format. A flat binary contains raw machine code bytes starting exactly at offset zero, with no headers. The compiler and linker are instructed to assume the program will be loaded at a fixed virtual address (in our case, \texttt{0x400000}). Because our paging system maps the first 4GB using 4MB Big Pages, this address is already safely mapped and accessible in Ring 0.
+
+To produce a flat binary, the cross-compiler is invoked with specific flags:
+\begin{itemize}
+    \item \texttt{-ffreestanding -nostdlib}: Prevents linking against standard C libraries.
+    \item \texttt{-Wl,-Ttext,0x400000,-e,main}: Instructs the linker to resolve all internal memory references relative to \texttt{0x400000} and sets \texttt{main} as the entry point.
+    \item \texttt{-Wl,--oformat,binary}: Strips all ELF metadata, resulting in pure x86 instructions.
+\end{itemize}
+
+\section{The Loader Mechanism}
+The loader is responsible for transferring the program from the FAT32 filesystem into physical memory and jumping to it.
+
+\begin{lstlisting}[language=C++, title=kernel/loader.cpp -- The Loader]
+#define USER_LOAD_ADDRESS 0x400000
+
+void load_and_run(uint8_t* binary, uint32_t size) {
+    uint8_t* dest = (uint8_t*)USER_LOAD_ADDRESS;
+    for (uint32_t i = 0; i < size; i++) {
+        dest[i] = binary[i];
+    }
+
+    // Cast the load address to a function pointer
+    typedef void (*program_t)(void (*)(const char*));
+    program_t program = (program_t)USER_LOAD_ADDRESS;
+    
+    // Execute the program!
+    program(sys_open_notepad);
+}
+\end{lstlisting}
+
+\section{The Kernel API: Bypassing Syscalls for Ring 0 Execution}
+Modern operating systems rely on software interrupts (e.g., \texttt{int 0x80}) to transition the CPU from User Mode (Ring 3) to Kernel Mode (Ring 0) when a program requests a service. However, because our initial programs run in Kernel Mode, using a software interrupt causes stack frame misalignment due to the absence of privilege-level switching (the CPU omits pushing \texttt{ESP} and \texttt{SS}).
+
+To solve this, Abyss OS provides an API via direct C++ function pointers. The kernel hands the executing program a pointer to a kernel-level function, which the program can call identically to a local function.
+
+\begin{lstlisting}[language=C, title=programs/hello.c -- The User Program]
+// Define a function pointer type matching the kernel API
+typedef void (*api_open_notepad)(const char*);
+
+void main(api_open_notepad open_notepad) {
+    // Call the kernel API directly
+    open_notepad("SUCCESS!\n\nThis text was written by HELLO.BIN.\n"
+                 "I am a standalone C program loaded\n"
+                 "off the FAT32 hard drive!");
+}
+\end{lstlisting}
+
+When the program executes \texttt{open\_notepad}, it triggers \texttt{sys\_open\_notepad} in the kernel, copying the requested string into the GUI's shared \texttt{notepad\_text} buffer and forcing the Notepad window to render. This effectively demonstrates code execution and cross-boundary communication.
+
+\newpage
 \appendix
-\section{Debugging Journal: Errors Encountered and Solutions}
+
+\chapter{Debugging Journal: Errors Encountered and Solutions}
+
+This appendix documents every major bug encountered during the development of Abyss OS, the symptoms that revealed them, and the exact fixes applied.
+
 This appendix documents every major bug encountered during the development of Abyss OS, the symptoms that revealed them, and the exact fixes applied. It serves as a practical reference for common bare-metal programming mistakes.
 
 % ─────────────────────────────────────────────
+
+\subsection*{Phase 27: Executable Freezes \& the ELF Header Trap}
+\textbf{Symptom:} Double-clicking \texttt{HELLO.BIN} in the File Explorer caused the OS to instantly freeze (the mouse cursor stopped moving). \\
+\textbf{Diagnosis:} Although the file was named \texttt{.bin}, GCC still compiled it as an ELF executable by default. The ELF file begins with the ASCII signature \texttt{0x7F 'E' 'L' 'F'}. The Abyss OS loader copied this file to \texttt{0x400000} and jumped to it, forcing the CPU to attempt executing the ELF headers as raw x86 machine code, resulting in an invalid opcode crash. Furthermore, an earlier bug involving \texttt{int 0x80} from Ring 0 caused stack misalignment (missing \texttt{ESP} and \texttt{SS}), confusing the \texttt{iret} instruction. \\
+\textbf{Solution:} Replaced the syscalls with a direct C++ function pointer passed to the program. Crucially, the compiler command was updated to pass \texttt{--oformat,binary} to the linker, stripping the ELF metadata and producing a pure flat binary.
+
 \subsection*{Phase 14--15: Multitasking \& Context Switching}
 
 \subsubsection*{Bug 1: Dereferencing the Stack Pointer Instead of Using Its Address}
@@ -920,7 +1582,9 @@ In the window manager (\texttt{kernel/ui.cpp}), we expanded our global \texttt{w
 This successfully demonstrated a true OS architecture: a hardware driver providing abstracted data to a high-level graphical window manager!
 
 \newpage
-\section{Complete Source Code}
+
+\chapter{Complete Source Code}
+
 
 \subsection{Makefile}
 \begin{lstlisting}[language={bash}]

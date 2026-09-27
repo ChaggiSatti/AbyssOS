@@ -31,17 +31,24 @@ extern "C" void fault_handler(const struct regs_t* r){
         vga_clear();
         vga_print("Abyss is angered!! Your connection with Abyss is severed!!\n");
         vga_print(exception_messages[r->int_no]);
+        while(1){
+            asm volatile("cli");
+            asm volatile("hlt");
+        }
     }else if(r->int_no == 128){
         if(r->eax == 1){
             char* add = (char*)r->ebx;
             vga_print(add);
+            
+            // return;
         }
+        return;
+        // if(r->eax == 2){
+        //     return;
+        // }
 
     }
-    while(1){
-        asm volatile("cli");
-        asm volatile("hlt");
-    }
+    
 }
 extern "C" void timer_tick(); 
 char keyboard_buffer[256];

@@ -1,0 +1,3318 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10},
+  keywordstyle=\color{blue},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red}
+}
+
+\title{\textbf{Abyss OS: Complete Architecture and Theory Guide}}
+\author{Built by After-Dark \& Antigravity}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Phase 0: The Toolchain (The Prerequisites)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Problem with Compilers}
+When you write C++ code and compile it on a Linux machine using \texttt{g++}, the compiler assumes two things:
+\begin{enumerate}
+    \item You are building a program for Linux (it automatically links against \texttt{glibc}, the Linux standard library).
+    \item You want to use the host OS's startup code (like \texttt{crt0}), which sets up command-line arguments and environment variables before calling \texttt{main()}.
+\end{enumerate}
+If we try to run a Linux-compiled binary directly on bare metal without an OS underneath it, the CPU will immediately crash because none of those libraries, OS system calls, or startup routines exist. 
+
+\subsection{Building the Cross-Compiler}
+To solve this, we had to build our own compiler from scratch---a compiler that runs on Linux, but targets "bare-metal x86" (the \texttt{i686-elf} target). We downloaded the raw source code for two massive open-source projects:
+\begin{itemize}
+    \item \textbf{GNU Binutils:} The tools that handle assembly code and linking (\texttt{as}, \texttt{ld}).
+    \item \textbf{GCC (GNU Compiler Collection):} The tool that turns our C++ code into assembly (\texttt{gcc}, \texttt{g++}).
+\end{itemize}
+We configured them with flags like \texttt{--disable-nls} (no native language support), \texttt{--without-headers} (no standard C library headers), and \texttt{--target=i686-elf}. Once compiled, we placed them in \texttt{\textasciitilde/opt/cross/bin}. This gave us \texttt{i686-elf-g++}, a compiler that generates pure, standalone x86 machine code completely independent of Linux.
+
+\subsection{Other Dependencies}
+We also installed \textbf{NASM} (The Netwide Assembler) to write our bootloader and low-level routines, \textbf{QEMU} as our virtual machine emulator to test the OS without constantly restarting our physical PC, and \textbf{GRUB / mtools / xorriso} to package our compiled binary into a bootable ISO file.
+
+\section{Phase 0.5: The Build System (Makefile)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Compiler Flags}
+In our Makefile, we compile our C++ code using a very specific set of flags:
+\begin{lstlisting}[language=bash]
+i686-elf-g++ -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti -c file.cpp -o file.o
+\end{lstlisting}
+Here is why every single flag is critical for bare-metal OS development:
+\begin{itemize}
+    \item \textbf{\texttt{-ffreestanding}} \& \textbf{\texttt{-nostdlib}}: Tells the compiler that the standard C/C++ library (\texttt{libc}, \texttt{<iostream>}, \texttt{<string>}) does not exist. The OS must run entirely independently without any pre-built operating system features.
+    \item \textbf{\texttt{-fno-exceptions}} \& \textbf{\texttt{-fno-rtti}}: C++ features like \texttt{try/catch} blocks and Run-Time Type Information (RTTI) require massive runtime support libraries behind the scenes. Because we don't have those libraries, we must strictly disable these C++ features to prevent the compiler from generating calls to non-existent code.
+    \item \textbf{\texttt{-O2}}: Optimizes the generated machine code for speed.
+    \item \textbf{\texttt{-Wall -Wextra}}: Enables strict warnings to catch subtle bugs.
+\end{itemize}
+
+\subsection{NASM and QEMU}
+\begin{itemize}
+    \item \textbf{NASM:} We use the Netwide Assembler to compile our low-level \texttt{.asm} files into ELF32 object files (\texttt{nasm -f elf32}). Assembly is required for tasks C++ physically cannot perform, like explicitly configuring CPU registers to load the GDT or trigger User Mode.
+    \item \textbf{QEMU:} We use \texttt{qemu-system-i386} as our virtual machine. Instead of flashing our OS to a USB drive and rebooting a physical computer every time we write code, QEMU safely emulates a 32-bit x86 processor directly on top of Linux.
+\end{itemize}
+
+\section{Phase 1: The Foundation \& Booting}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Multiboot Standard (\texttt{boot.asm})}
+When a PC turns on, the motherboard's BIOS loads a bootloader from the hard drive. Writing a bootloader from absolute scratch that interfaces with the ancient 16-bit BIOS and switches the CPU into 32-bit Protected Mode is incredibly tedious. Instead, we use \textbf{GRUB}. GRUB requires our kernel to comply with the \textbf{Multiboot Specification}. 
+
+In \texttt{boot.asm}, we defined a "Magic Number" (\texttt{0x1BADB002}) and some flags at the very top of our binary. When GRUB scans our file, it sees this magic number, recognizes it as a valid kernel, handles the messy hardware initialization, and jumps directly to our \texttt{\_start} label in 32-bit mode.
+
+\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/boot.asm]
+MBALIGN  equ  1 << 0
+MEMINFO  equ  1 << 1
+FLAGS    equ  MBALIGN | MEMINFO
+MAGIC    equ  0x1BADB002
+CHECKSUM equ -(MAGIC + FLAGS)
+
+section .multiboot
+align 4
+    dd MAGIC
+    dd FLAGS
+    dd CHECKSUM
+\end{lstlisting}
+
+\subsection{The Linker Script (\texttt{linker.ld})}
+Compilers just generate code; the \textbf{Linker} glues it together. By default, a linker might place our code at memory address \texttt{0x400000} (standard for Linux apps). However, standard x86 kernels are expected to be loaded exactly at the 1 Megabyte mark (\texttt{0x100000}). The \texttt{linker.ld} file forces the linker to put our Multiboot header at the very beginning of the binary file and sets the base memory address to 1MB. 
+
+\begin{lstlisting}[title=linker.ld]
+ENTRY(_start)
+
+SECTIONS {
+    . = 1M;
+
+    .text BLOCK(4K) : ALIGN(4K) {
+        *(.multiboot)
+        *(.text)
+    }
+    /* Data and BSS sections follow... */
+}
+\end{lstlisting}
+
+\section{Phase 2: The Display (VGA Driver)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{What is VGA?}
+VGA stands for \textbf{Video Graphics Array}. Created by IBM in 1987, it became the universal standard for PC displays. Specifically, we use \textbf{VGA Text Mode}. In this mode, the graphics card divides the screen into an 80x25 grid. Instead of drawing individual pixels, the OS writes ASCII characters to specific memory addresses, and the VGA hardware itself handles drawing the pixels of the font on the screen.
+
+\subsection{Memory-Mapped I/O (\texttt{kernel/vga.cpp})}
+In a normal C++ program, you print text using \texttt{std::cout}. In kernel space, \texttt{std} does not exist. We have to talk directly to the graphics hardware. 
+
+The graphics card constantly monitors a specific chunk of physical RAM starting at address \texttt{0xB8000}. Any bytes written to this address are immediately drawn on the screen as text. We created a pointer to \texttt{0xB8000} and marked it as \texttt{volatile} so the C++ optimizer wouldn't erase our memory writes.
+
+\begin{lstlisting}[language=C++, title=kernel/vga.cpp]
+#include "vga.h"
+
+// Pointer to VGA text mode buffer
+volatile uint16_t* vga = (uint16_t*)0xB8000;
+int cursor_pos = 0;
+
+void vga_print_char(char c) {
+    if (c == '\b') { // Backspace
+        if (cursor_pos > 0) {
+            cursor_pos--;
+            vga[cursor_pos] = (0x0F << 8) | ' ';
+        }
+    } else {
+        // Upper byte: color (0x0F = white on black)
+        // Lower byte: ASCII character
+        vga[cursor_pos] = (0x0F << 8) | c;
+        cursor_pos++;
+    }
+}
+\end{lstlisting}
+
+\section{Phase 3: The Brain (GDT - Global Descriptor Table)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{What is the GDT?}
+The \textbf{Global Descriptor Table (GDT)} is a fundamental data structure in the x86 architecture. Introduced to provide memory protection, the GDT is an array of 8-byte entries (descriptors). Each entry describes a "segment" of memory, detailing where the segment starts (Base), how large it is (Limit), and what permissions it has (Executable, Readable, Writable, Ring 0 vs Ring 3 privileges).
+
+\subsection{Building the GDT (\texttt{kernel/gdt.cpp})}
+We built a GDT in RAM containing three highly-specific 8-byte entries:
+\begin{enumerate}
+    \item \textbf{Null Descriptor:} Required by the CPU to catch null-pointer errors.
+    \item \textbf{Kernel Code Segment:} Defines memory as executable code for Ring 0.
+    \item \textbf{Kernel Data Segment:} Defines memory as readable and writable for Ring 0.
+\end{enumerate}
+
+\begin{lstlisting}[language=C++, title=kernel/gdt.cpp]
+void gdt_init() {
+    gdtr.limit = sizeof(gdt) - 1;
+    gdtr.base = (uint32_t)&gdt;
+
+    gdt_set_gate(0, 0, 0, 0, 0);                // Null segment
+    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Code segment (Ring 0)
+    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Data segment (Ring 0)
+
+    gdt_flush(&gdtr);
+}
+\end{lstlisting}
+
+\subsection{Loading the GDT (\texttt{boot/gdt\_flush.asm})}
+We told the CPU where our table was using the \texttt{lgdt} assembly instruction. However, the CPU's Code Segment (\texttt{CS}) register cannot be updated directly with a \texttt{mov} instruction. We had to perform a \textbf{Far Jump} (\texttt{jmp 0x08:.flush}) to force the CPU to flush its pipeline and start using our new Kernel Code Segment (selector \texttt{0x08}).
+
+\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/gdt\_flush.asm]
+global gdt_flush
+gdt_flush:
+    mov eax, [esp+4] ; Load the GDTR pointer
+    lgdt [eax]       ; Load the new GDT
+
+    mov ax, 0x10     ; Load data segment selector (0x10)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    jmp 0x08:.flush  ; Far jump to code segment (0x08)
+.flush:
+    ret
+\end{lstlisting}
+
+\section{Phase 4: The Nervous System (IDT - Interrupt Descriptor Table)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{What is the IDT?}
+The \textbf{Interrupt Descriptor Table (IDT)} is the mechanism the CPU uses to handle events that interrupt normal execution. These events include hardware interrupts, software interrupts, and CPU exceptions. The IDT is an array of exactly 256 entries pointing to Interrupt Service Routines (ISRs).
+
+\subsection{Building the IDT (\texttt{kernel/idt.cpp})}
+We defined the 256-entry table and initialized every entry. If an interrupt fires on a zeroed entry, the CPU panics.
+
+\begin{lstlisting}[language=C++, title=kernel/idt.cpp]
+void idt_set_gate(int num, uint32_t base, uint16_t sel, uint8_t flag) {
+    idt[num].base_low = base & 0xFFFF;
+    idt[num].base_high = (base >> 16) & 0xFFFF;
+    idt[num].sel = sel;
+    idt[num].zero = 0;
+    idt[num].flags = flag;
+}
+\end{lstlisting}
+
+\section{Phase 5: The PIC and Hardware I/O}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{What is the PIC?}
+The \textbf{Programmable Interrupt Controller (8259 PIC)} manages hardware interrupts. When you press a key on the keyboard, it sends an electrical signal (an \textbf{IRQ}) to the PIC. The PIC then tells the CPU to handle the keyboard.
+
+\subsection{Remapping the PIC (\texttt{kernel/pic.cpp})}
+By default, the old BIOS maps the PIC's IRQ 0-7 to Interrupts 8-15 in the IDT, colliding with Intel's reserved CPU Exceptions. We wrote a driver that uses inline assembly (\texttt{inb} and \texttt{outb} in \texttt{io.h}) to send Initialization Command Words (ICWs) to the PIC chips to shift their interrupts to 32-47.
+
+\begin{lstlisting}[language=C++, title=kernel/pic.cpp]
+void pic_remap(int offset1, int offset2) {
+    // Wake up and Reset (ICW1)
+    outb(0x20, 0x11);
+    outb(0xA0, 0x11);
+    
+    // Remap offsets (ICW2)
+    outb(0x21, offset1); // Master starts at 32
+    outb(0xA1, offset2); // Slave starts at 40
+    
+    // Master-Slave Wiring (ICW3)
+    outb(0x21, 4);
+    outb(0xA1, 2);
+    
+    // x86 Mode (ICW4)
+    outb(0x21, 0x01);
+    outb(0xA1, 0x01);
+}
+\end{lstlisting}
+
+\section{Phase 6: Exception Handling (The Kernel Panic)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{Standardizing the Stack Frame (\texttt{boot/interrupts.asm})}
+We needed 32 Interrupt Service Routines (ISRs) for CPU exceptions. We used NASM macros to generate them dynamically. Some exceptions push an error code; others do not. Our macro pushes a dummy \texttt{0} for those that don't to keep the stack uniform.
+
+\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/interrupts.asm]
+%macro ISR_NOERRCODE 1
+  global isr%1
+  isr%1:
+    push 0      ; Dummy error code
+    push %1     ; Interrupt number
+    jmp isr_common_stub
+%endmacro
+
+isr_common_stub:
+    pusha        ; Save registers
+    push esp     ; Pass stack pointer to C++
+    call fault_handler
+    add esp, 4
+    popa         ; Restore registers
+    add esp, 8
+    iret
+\end{lstlisting}
+
+\subsection{Mapping C++ Structs over CPU Memory (\texttt{kernel/isr.cpp})}
+In C++, we defined a struct (\texttt{regs\_t}) that mirrors the data pushed to the Stack. This allows us to access \texttt{r->int\_no} to determine which exception occurred and print a Kernel Panic message.
+
+\begin{lstlisting}[language=C++, title=kernel/isr.cpp]
+struct regs_t {
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax; // Pushed by pusha
+    uint32_t int_no, err_code;                       // Pushed by macros
+    uint32_t eip, cs, eflags, useresp, ss;           // Pushed by CPU
+};
+
+extern "C" void fault_handler(struct regs_t* r) {
+    if (r->int_no < 32) {
+        vga_clear();
+        vga_print("KERNEL PANIC! CPU EXCEPTION: ");
+        vga_print(exception_messages[r->int_no]);
+        
+        while(1) { asm volatile("cli; hlt"); }
+    }
+}
+\end{lstlisting}
+
+\section{Phase 7: Memory Management (Paging)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Danger of Physical RAM}
+Before Paging, our C++ kernel operated in a Flat Memory Model, meaning it had direct, unfiltered access to the physical RAM sticks on the motherboard. If a rogue program wrote to an invalid address, it could overwrite the kernel and crash the entire system. 
+
+To solve this, we implemented \textbf{Paging}. Paging is a hardware feature that intercepts every single memory request from the CPU and secretly redirects it to a different physical address using a map. This creates a "Virtual Memory" space, allowing us to sandbox applications, allocate dynamic memory (\texttt{malloc}), and protect the kernel.
+
+\subsection{The Two-Tier Hierarchy}
+Because creating a single massive map for 4GB of RAM would waste 4MB of RAM just to store the map itself, Intel uses a two-tier hierarchy:
+\begin{enumerate}
+    \item \textbf{Page Directory:} A 4KB table containing 1024 pointers to Page Tables.
+    \item \textbf{Page Table:} A 4KB table containing 1024 pointers to physical 4KB memory \textbf{Pages}.
+\end{enumerate}
+
+\subsection{Identity Mapping (\texttt{kernel/paging.cpp})}
+To prevent our kernel from crashing the moment Paging was enabled, we had to "Identity Map" the first 4 Megabytes of RAM. This ensures that Virtual Address \texttt{0x1000} points exactly to Physical Address \texttt{0x1000}.
+
+The CPU requires these tables to be perfectly aligned to 4096-byte boundaries in RAM (\texttt{\_\_attribute\_\_((aligned(4096)))}). Because the CPU assumes the bottom 12 bits of the address are zeroes, it reuses those 12 bits to store permissions (like Read/Write and Present flags). We used a bitwise OR (\texttt{| 7}) to set the Present, Read/Write, and User Access flags to true.
+
+\begin{lstlisting}[language=C++, title=kernel/paging.cpp]
+struct page_directory_t page_directory __attribute__((aligned(4096)));
+struct page_table_t first_page_table __attribute__((aligned(4096)));
+
+void init_paging() {
+    for(int i = 0; i < 1024; i++) {
+        page_directory.tablesPhysical[i] = 0x02; // Not Present
+    }
+
+    // Identity Map the first 4MB
+    for(int i = 0; i < 1024; i++) {
+        first_page_table.pages[i] = (i * 4096) | 7; // Present, R/W, User Access
+    }
+
+    page_directory.tablesPhysical[0] = ((uint32_t)&first_page_table) | 7;
+}
+\end{lstlisting}
+
+\subsection{Flipping the Switch (\texttt{boot/paging.asm})}
+With the tables built in RAM, we passed the physical address of the Page Directory to the CPU's \texttt{cr3} register. Finally, we enabled the 31st bit of the \texttt{cr0} control register. The exact millisecond that bit flipped to 1, physical memory addressing was disabled, and Abyss seamlessly transitioned into Virtual Memory space without skipping a single CPU cycle.
+
+\begin{lstlisting}[language={[x86masm]Assembler}, title=boot/paging.asm]
+load_page_directory:
+    push ebp
+    mov ebp, esp
+    mov eax, [ebp+8]   
+    mov cr3, eax       ; Load the Page Directory pointer
+    mov esp, ebp
+    pop ebp
+    ret
+
+enable_paging:
+    push ebp
+    mov ebp, esp
+    mov eax, cr0
+    or eax, 0x80000000 ; Flip the 31st bit (Paging Bit) to 1
+    mov cr0, eax       ; Paging turns ON!
+    mov esp, ebp
+    pop ebp
+    ret
+\end{lstlisting}
+
+\section{Phase 8: The Abyss Shell (Interactive CLI)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Need for a String Library (\texttt{kernel/string.cpp})}
+An interactive shell requires the ability to compare the characters typed by the user against known commands (like \texttt{"clear"} or \texttt{"ping"}). However, because Abyss runs on bare metal, standard C++ libraries like \texttt{<string>} or \texttt{<cstring>} do not exist. 
+
+To solve this, we built a custom string library from scratch. We implemented our own \texttt{strcmp} function that iterates through two character arrays, comparing them byte-by-byte until a null-terminator (\texttt{'\textbackslash 0'}) is reached.
+
+\subsection{The Keyboard Buffer (\texttt{kernel/isr.cpp})}
+Previously, our keyboard interrupt handler (\texttt{isr33\_handler}) simply printed characters directly to the VGA display. To create a shell, we introduced a keyboard buffer (\texttt{char keyboard\_buffer[256]}) to store keystrokes in memory.
+
+When a keyboard hardware interrupt fires, we check the character:
+\begin{itemize}
+    \item \textbf{Newline (\texttt{'\textbackslash n'}):} The user pressed Enter. We trigger the \texttt{execute\_command()} function.
+    \item \textbf{Backspace (\texttt{'\textbackslash b'}):} We decrement the buffer index and visually erase the character from the VGA display by instructing the VGA driver to print a space character over it.
+    \item \textbf{Standard Characters:} We append the character to the buffer and print it to the screen.
+\end{itemize}
+
+\subsection{Executing Commands}
+When the Enter key is pressed, \texttt{execute\_command()} null-terminates the buffer so our \texttt{strcmp} function knows where the string ends. It then compares the buffer against a list of hardcoded commands. 
+
+If the user types \texttt{clear}, we call \texttt{vga\_clear()}. If the user types a custom "curse" word, we trigger a Non-Maskable Interrupt (\texttt{asm volatile("int \$0x2");}), deliberately invoking our Kernel Panic safety net to freeze the system. Finally, the buffer is reset to 0, and the \texttt{Abyss >>} prompt is redrawn, creating a fully interactive OS experience.
+
+\section{Phase 9: The Task State Segment (TSS)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Ring 3 Interrupt Problem}
+When the CPU is operating in Ring 0 (Kernel Mode) and a hardware interrupt fires, the CPU simply pushes the current state onto the stack and handles the interrupt. However, when the CPU is in Ring 3 (User Mode), it cannot use the User Stack to handle interrupts, as the User Stack might be corrupted or lack the necessary privileges. The CPU must switch back to the secure Ring 0 Kernel Stack.
+
+But how does the CPU know where the Kernel Stack is located? 
+
+\subsection{The TSS Structure (\texttt{kernel/tss.cpp})}
+Intel solved this by requiring the OS to maintain a \textbf{Task State Segment (TSS)}. While the TSS has many legacy fields from ancient hardware task-switching mechanisms, modern operating systems only use two fields: \texttt{ss0} (the Ring 0 Stack Segment) and \texttt{esp0} (the Ring 0 Stack Pointer).
+
+We created a TSS structure in memory, zeroed it out, and populated \texttt{ss0} with \texttt{0x10} (our Kernel Data Segment) and \texttt{esp0} with the exact memory address of our Kernel Stack. 
+
+\subsection{Loading the TSS}
+To tell the CPU where this structure lives, we added a 6th entry to our Global Descriptor Table (GDT) pointing to the TSS, using the access byte \texttt{0xE9} (Present, Ring 3, 32-bit TSS). Finally, we used the \texttt{ltr} (Load Task Register) assembly instruction to officially lock the TSS into the CPU hardware.
+
+\section{Phase 10: User Mode (Ring 3)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Fake Interrupt Return (\texttt{boot/usermode.asm})}
+The x86 architecture does not have a simple instruction to switch from Ring 0 to Ring 3. To enter User Mode, we must trick the CPU. 
+
+When returning from an interrupt, the CPU executes the \texttt{iret} (Interrupt Return) instruction, which pops five values off the stack: the User's \texttt{SS}, \texttt{ESP}, \texttt{EFLAGS}, \texttt{CS}, and \texttt{EIP}. By manually pushing these five values onto the stack (using our new Ring 3 GDT segment selectors \texttt{0x1B} and \texttt{0x23}) and manually executing \texttt{iret}, the CPU is tricked into seamlessly resuming execution in Ring 3.
+
+\subsection{Paging Permissions}
+When we first jumped into Ring 3, the CPU immediately threw a \textbf{Page Fault}. This occurred because our Paging system originally mapped the memory with permissions \texttt{0x03} (Present, Read/Write, but strictly Ring 0). The Memory Management Unit blocked the Ring 3 code from executing. 
+
+We updated our Page Table permissions to \texttt{0x07} (Binary \texttt{111}), explicitly granting User Mode access to the memory pages. 
+
+\subsection{The Sandbox}
+Once Paging permissions were fixed, our Ring 3 test function executed successfully. To prove we were truly restricted, we attempted to execute \texttt{cli} (Clear Interrupts)---a privileged Ring 0 instruction. As expected, the CPU's hardware security intercepted the illegal operation and threw a \textbf{General Protection Fault}, triggering our Kernel Panic and safely halting the system before any damage could occur. Abyss OS now has a fully secure application sandbox.
+
+\section{Phase 11: Dynamic Memory (The Heap)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Need for Dynamic Allocation}
+In early development, all memory allocation was static. Arrays like \texttt{char keyboard\_buffer[256]} were hardcoded into the binary at compile time. However, to build a robust OS, the system must be able to allocate memory on the fly at runtime (e.g., dynamically sizing a buffer to load a file from disk). In standard C/C++, this is handled by \texttt{malloc()} and \texttt{free()}, but in a bare-metal kernel, we must build the memory allocator from scratch.
+
+\subsection{The Bump Allocator (\texttt{kernel/memory.cpp})}
+We implemented a \textbf{Bump Allocator}, which is the simplest form of dynamic memory allocation. Because our Paging system identity-maps the first 4 Megabytes of physical RAM, and our kernel occupies the 1MB mark (\texttt{0x100000}), we safely designated the 2MB mark (\texttt{0x200000}) as the start of our "Heap".
+
+The allocator maintains a single global pointer (\texttt{current\_heap\_pointer}). When a program requests memory via \texttt{malloc(size)}, the allocator saves the current pointer to return to the user, and then simply "bumps" the global pointer forward by the requested size.
+
+\begin{lstlisting}[language=C++, title=kernel/memory.cpp]
+uint32_t heap_start = 0x200000;
+uint32_t current_heap_pointer;
+
+void memory_init() {
+    current_heap_pointer = heap_start;
+}
+
+void* malloc(size_t size) {
+    uint32_t allocated_address = current_heap_pointer;
+    current_heap_pointer += size;
+    return (void*)allocated_address;
+}
+\end{lstlisting}
+
+While highly efficient for allocation, a pure Bump Allocator has a major limitation: it cannot free memory. More advanced allocators (like linked-list or buddy allocators) are required to track freed blocks and prevent memory exhaustion. However, the Bump Allocator provides a perfect foundation for initial kernel operations.
+
+\section{Phase 12: The System Timer (PIT)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Metronome of the OS}
+An operating system requires a concept of time to schedule tasks, pause execution (\texttt{sleep()}), or track uptime. On x86 architecture, this is handled by the \textbf{Programmable Interval Timer (PIT)}, a hardware chip that acts like a metronome. It triggers a hardware interrupt at a highly specific frequency.
+
+\subsection{Configuring the PIT (\texttt{kernel/timer.cpp})}
+The base hardware clock of the PIT runs at 1,193,180 Hz. To make the timer tick at a human-readable speed (like 100 Hz, or 100 times per second), we calculate a divisor: \texttt{1193180 / 100}.
+
+Using our I/O ports, we send a command byte to the PIT's command port (\texttt{0x43}) to configure it as a rate generator. We then send our calculated divisor to the PIT's data port (\texttt{0x40}). Because the data port only accepts 8 bits (1 byte) at a time, we use a bitwise AND mask (\texttt{\& 0xFF}) to split our 32-bit integer into two 8-bit chunks, sending the lowest byte first, followed by the highest byte.
+
+\subsection{Handling the Interrupt}
+Because the PIT is physically wired to IRQ 0 on the motherboard, and we remapped our PIC to start at offset 32, every tick of the timer triggers \textbf{Interrupt 32} in our IDT. 
+
+We updated our \texttt{isr32\_handler} to call a \texttt{timer\_tick()} function, which simply increments a global \texttt{tick\_count} variable. Finally, we wrote a custom integer-to-string (\texttt{itoa}) conversion algorithm in our string library, allowing our interactive shell to query the timer and print the system uptime directly to the screen!
+
+\section{Phase 13: System Calls (The Bridge)}
+{\small\textit{\textbf{Completed:} August 2026}}\par\medskip
+\subsection{The Sandbox Limitation}
+While User Mode successfully protects the kernel from malicious or buggy applications, it introduces a major limitation: Ring 3 programs are physically blocked from interacting with hardware. A Ring 3 program cannot execute \texttt{inb} to read the keyboard, nor can it write to the VGA memory at \texttt{0xB8000}. If it tries, the Memory Management Unit throws a Page Fault, or the CPU throws a General Protection Fault.
+
+If an application cannot read input or print output, it is entirely useless.
+
+\subsection{Software Interrupts (\texttt{int 0x80})}
+To solve this, modern operating systems implement \textbf{System Calls}. A System Call is a deliberate, controlled software interrupt. In Linux, and in Abyss, this is historically mapped to interrupt vector \texttt{0x80} (128 in decimal).
+
+We updated our IDT to register \texttt{isr128}. Crucially, we assigned it an access flag of \texttt{0xEE} (Present, Ring 3, 32-bit Interrupt Gate). This specific flag overrides the standard security checks and legally permits a Ring 3 program to trigger this one specific Ring 0 interrupt.
+
+\subsection{Passing Arguments via Registers}
+When a User Mode program needs the kernel to perform an action (like printing text), it cannot simply pass C++ variables, as the stack contexts are completely different. Instead, it places arguments into the CPU's general-purpose registers before triggering the interrupt:
+\begin{itemize}
+    \item \textbf{\texttt{EAX}:} The System Call Number (e.g., \texttt{1} = Print String).
+    \item \textbf{\texttt{EBX}:} The first argument (e.g., A memory pointer to the string).
+\end{itemize}
+
+\subsection{The Dispatcher (\texttt{kernel/isr.cpp})}
+When \texttt{int 0x80} is triggered, the CPU safely pauses the User Mode application, switches to the secure Kernel Stack (using the TSS we built in Phase 9), and jumps into Ring 0 to execute our \texttt{fault\_handler}.
+
+We updated the handler to intercept \texttt{int\_no == 128}. The kernel acts as a Dispatcher: it reads the command number from \texttt{EAX}, retrieves the string pointer from \texttt{EBX}, and securely calls \texttt{vga\_print()} on behalf of the User Mode application. Once the text is drawn, the kernel executes \texttt{iret}, seamlessly dropping back into Ring 3 and resuming the application exactly where it left off.
+
+\section{Phase 14: Multitasking (The Scheduler)}
+{\small\textit{\textbf{Completed:} August 19, 2026}}\par\medskip
+\subsection{The Illusion of Parallelism}
+A single-core CPU can only execute one instruction at a time. To run multiple programs "simultaneously," an Operating System must rapidly switch between them, creating the illusion of parallel execution. This requires a Scheduler.
+
+\subsection{The Task Structure (TCB)}
+We created a \texttt{Task} structure (often called a Thread Control Block) to hold the state of a program when it is paused. Crucially, it stores the CPU's Stack Pointers (\texttt{ESP} and \texttt{EBP}). We connected these Tasks into a Circular Linked List to form our \texttt{ready\_queue}.
+
+\subsection{The Isolated Stack}
+Every task must have its own isolated stack. If two tasks shared a stack, returning from a function in one task would pop the return address of the other task, instantly corrupting the CPU execution flow. When we call \texttt{create\_task}, we allocate a fresh 4KB block of memory for the task's private stack.
+
+\subsection{The Context Switch Trap}
+Switching to an already-running task is easy, as its stack contains the correctly pushed registers from when it was paused. However, switching to a brand new task is dangerous, as its stack is empty. To solve this, our C++ code manually injects a "fake" state into the new task's stack (including the Instruction Pointer and dummy registers) so that the Assembly context switch can safely \texttt{popa} and \texttt{ret} into the new function.
+
+\subsection{The Assembly Switch (\texttt{boot/task.asm})}
+The \texttt{perform\_task\_switch} function is the heart of the OS. It pushes all current registers (\texttt{pusha}) to save the active task's state on its own stack. It then updates the \texttt{current\_task} pointer, swaps the CPU's \texttt{ESP} to point to the next task's stack, pops the registers (\texttt{popa}), and executes \texttt{ret} to resume the new task. We successfully proved this by running two infinite loops (Task A and Task B) that voluntarily yielded control to each other!
+
+\section{Phase 15: Preemptive Multitasking}
+{\small\textit{\textbf{Completed:} August 20, 2026}}\par\medskip
+\subsection{The Metronome of the OS}
+In Cooperative Multitasking, tasks must voluntarily yield the CPU. If a task enters an infinite loop without yielding, the OS freezes. To solve this, we implemented Preemptive Multitasking. The Programmable Interval Timer (PIT) is hardwired to send an electrical interrupt (IRQ 0) to the CPU 100 times a second.
+
+\subsection{The IRET Stack Frame}
+When a hardware interrupt fires, the CPU automatically pushes the EFLAGS, Code Segment (CS), and Instruction Pointer (EIP) onto the stack. Therefore, the assembly handler must end with an \texttt{iret} (Interrupt Return) instruction to pop all three. We updated our \texttt{create\_task} C++ function to fake an IRET stack frame when creating new tasks.
+
+\subsection{The Hardware Hijack}
+We injected the Context Switch logic directly into the \texttt{isr32} assembly block. 100 times a second, the CPU pauses the running task, jumps to \texttt{isr32}, saves the current task's Stack Pointer (ESP), overwrites the CPU's ESP with the next task's stack pointer, and calls \texttt{iret}. This forcefully teleports the CPU into the new task, entirely bypassing the C++ software flow, guaranteeing the OS never freezes.
+
+\section{Phase 16: The Virtual File System (VFS)}
+{\small\textit{\textbf{Completed:} August 27, 2026}}\par\medskip
+\subsection{The Core Problem}
+After building a multitasking kernel, the next fundamental challenge is giving the OS a concept of ``files.'' Without a file system, the OS has no way to load programs, read configuration, or store user data. However, we do not yet have a driver to communicate with a real hard drive. Writing an AHCI or NVMe driver from scratch is an enormous undertaking. We need a simpler approach to prove the concept first.
+
+\subsection{The Initial Ramdisk (initrd)}
+The solution is the \textbf{Initial Ramdisk}, or \texttt{initrd}. Before handing control to our C++ kernel, the GRUB bootloader is capable of loading additional binary blobs (``modules'') directly into the computer's physical RAM. We package a set of files into a standard \texttt{.tar} archive on the host machine, and tell GRUB to load that archive into memory. The result is a ``fake'' hard drive that lives entirely in RAM and is available from the very first instruction of our kernel. Linux itself still uses this exact mechanism today to load essential drivers during boot.
+
+\subsection{The Multiboot Information Structure}
+Once GRUB loads the \texttt{.tar} archive into RAM, our kernel needs to find it. GRUB solves this by writing a comprehensive ``Information Checklist'' into memory before booting us. This structure (defined by the Multiboot Specification) contains critical data including the total amount of physical RAM, the address of the VBE framebuffer, and crucially, the physical memory addresses of every loaded module (our RAM disk).
+
+Just before jumping to our \texttt{\_start} label in \texttt{boot.asm}, GRUB places a pointer to this structure inside the CPU's \texttt{EBX} register.
+
+\subsection{Passing the Pointer (boot.asm)}
+Because our OS is a C++ program, we need to pass this pointer from the Assembly world into the C++ world. We achieve this with a single instruction added to \texttt{\_start}:
+\begin{lstlisting}[language={[x86masm]Assembler}]
+push ebx       ; Push the Multiboot struct pointer as a C++ function argument
+call kernel_main
+\end{lstlisting}
+This places the pointer on the stack exactly where the C++ calling convention expects to find the first argument to a function.
+
+\subsection{The Decoder Ring (multiboot.h)}
+Raw memory is just a stream of bytes. To make sense of it in C++, we define a struct (\texttt{kernel/multiboot.h}) whose fields perfectly align with the layout of the Multiboot Information Structure defined in the spec. The \texttt{\_\_attribute\_\_((packed))} directive tells the compiler to add zero padding between fields, ensuring an exact byte-for-byte match with the raw memory. The two key fields we care about are \texttt{mods\_count} (how many modules GRUB loaded) and \texttt{mods\_addr} (the memory address of the list of loaded modules). A second struct, \texttt{multiboot\_mod\_list}, describes each individual module with its \texttt{mod\_start} and \texttt{mod\_end} physical memory addresses.
+
+\subsection{The VFS Interface (vfs.h)}
+The VFS is a universal adapter between the kernel and any underlying storage driver. The core concept is a single struct called \texttt{fs\_node} (analogous to a Unix \texttt{inode}) that represents any file on any file system. Critically, it contains a C++ \textbf{function pointer} named \texttt{read}:
+
+\begin{lstlisting}[language=C++]
+struct fs_node {
+    char     name[128];
+    uint32_t flags;    // VFS_FILE or VFS_DIRECTORY
+    uint32_t length;
+    uint32_t inode;
+    uint32_t (*read)(fs_node*, uint32_t offset, uint32_t size, char* buf);
+};
+\end{lstlisting}
+
+The \texttt{vfs\_read()} wrapper function simply calls \texttt{node->read()} if it exists. This design means the kernel never needs to know which file system is underneath. A FAT32 file would store a \texttt{fat32\_read} pointer; a TarFS file stores a \texttt{tarfs\_read} pointer. The calling code is identical in both cases.
+
+\subsection{The TarFS Driver (initrd.cpp)}
+The TarFS driver parses the raw \texttt{.tar} archive bytes that GRUB loaded into RAM. The ustar TAR format is elegantly simple: every file is preceded by a 512-byte \texttt{tar\_header} struct containing the filename and file size (stored as an \textbf{octal ASCII string}), followed by the file's raw content padded to the next 512-byte boundary.
+
+The driver walks through memory block by block, converting each octal size string to an integer, building an \texttt{fs\_node} for each file, and wiring the \texttt{tarfs\_read} function pointer into the node. To find a file by name, \texttt{initrd\_findfile()} performs a linear scan through the node array using \texttt{strcmp}.
+
+\subsection{Result}
+On boot, the kernel successfully called \texttt{initrd\_init()}, located \texttt{hello.txt} inside the in-memory TAR archive, and read its contents through the VFS layer. The message ``Greetings from the Abyss' Virtual file system, mortal!!'' was printed directly from raw RAM, proving that the entire VFS stack functions correctly end-to-end.
+
+\section{Phase 17: The GUI (VESA Primitives \& Fonts)}
+{\small\textit{\textbf{Completed:} August 28, 2026}}\par\medskip
+
+\subsection{Understanding VESA, VBE, and the LFB}
+Up until this phase, Abyss OS communicated visually using \textbf{VGA Text Mode}. The video card was hardwired to divide the screen into an 80x25 grid, and the kernel simply wrote ASCII character codes into a specific memory region (\texttt{0xB8000}). The physical graphics hardware did the actual work of drawing the shapes of the letters onto the monitor. While extremely fast and simple, this prevented us from drawing anything other than standard ASCII characters. 
+
+To build a graphical user interface (GUI) with windows, shapes, and custom colors, we needed absolute pixel-level control. To achieve this, we utilized the \textbf{VESA BIOS Extensions (VBE)}.
+\begin{itemize}
+    \item \textbf{VESA} (Video Electronics Standards Association): An international consortium that standardizes computer video displays. 
+    \item \textbf{VBE} (VESA BIOS Extensions): A standard interface that allows an operating system to query the graphics card for available high-resolution modes (e.g., $1024 \times 768$ with 32-bit color) and switch into them during the boot process.
+    \item \textbf{LFB} (Linear Framebuffer): Once VBE switches the monitor into graphics mode, it disables the old text memory at \texttt{0xB8000}. Instead, it provides a \textbf{Linear Framebuffer}---a massive, contiguous block of physical RAM (often high up in the address space, e.g., \texttt{0xFD000000}) where every 32-bit chunk of memory directly corresponds to a single pixel on the screen. 
+\end{itemize}
+
+By configuring the GRUB bootloader to enable VBE via the Multiboot specification (\texttt{FLAGS = 0x04}), GRUB sets up the LFB for us. The kernel's job is simply to map that physical LFB address into its Virtual Memory using Paging (we used 4MB ``Big Pages'' to map the entire 4GB space quickly), and then write raw color hex codes directly into that memory to manipulate pixels.
+\subsection{Beyond the Pixel}
+While configuring the VBE framebuffer and writing a \texttt{put\_pixel} and \texttt{draw\_rect} function provided a graphical canvas, a modern OS requires much more sophisticated drawing primitives to build an aesthetically pleasing user interface. We opted for a deep crimson and purple ``Abyss'' theme, requiring gradients, circles, lines, and custom text rendering.
+
+\subsection{Linear Interpolation (Gradients)}
+To create a premium UI, we implemented \texttt{draw\_gradient\_rect}. Instead of filling a rectangle with a solid color, this algorithm fades smoothly from a start color (top) to an end color (bottom). This is accomplished via \textbf{Linear Interpolation (Lerp)}. For each row, the specific R, G, and B components are calculated proportionally based on the row's percentage down the screen:
+\begin{lstlisting}[language=C++]
+uint8_t r = r1 + (((int)r2 - (int)r1) * (int)i) / (int)h;
+\end{lstlisting}
+
+\subsection{Bresenham's Line Algorithm}
+Drawing a perfectly horizontal or vertical line is trivial using a \texttt{for} loop. However, drawing a diagonal line pixel-by-pixel is mathematically complex because you must determine which exact pixels on the grid best approximate the mathematical slope. To solve this without using extremely slow floating-point decimal math or division, we implemented \textbf{Bresenham's Line Algorithm}, an ingenious logic flow that relies purely on fast integer addition, subtraction, and error tracking to step along the line.
+
+\subsection{The Midpoint Circle Algorithm}
+To draw rounded UI elements (like status orbs), we implemented the \textbf{Midpoint Circle Algorithm} (specifically, a highly optimized variant known as Jesko's Method). Because a perfect circle is completely symmetrical across 8 separate octants, the algorithm only has to calculate the outer pixels for one-eighth of the circle (a 45-degree slice). For every pixel it calculates, it immediately plots 8 perfectly mirrored pixels in all directions, dramatically reducing CPU overhead. 
+
+To create a \texttt{fill\_circle} function, we simply replaced the 8 \texttt{put\_pixel} calls with 4 horizontal \texttt{draw\_line} calls connecting the mirrored left and right edges.
+
+\subsection{Bitmap Text Rendering}
+When we switched from VGA Text Mode to VESA Graphics Mode, we lost our interactive shell, as the physical GPU hardware stopped rendering ASCII characters from memory address \texttt{0xB8000}. To get text back, we built a \textbf{Bitmap Font Renderer}.
+
+We imported a standard 8x8 font (\texttt{font8x8\_basic.h}), which is a large array containing every ASCII character represented as an $8 \times 8$ grid of binary bits (where \texttt{1} means draw a pixel, and \texttt{0} means leave it blank). To draw a character, the kernel looks up the character in the array, loops through the $8 \times 8$ grid, and uses bitwise operations to check each pixel:
+\begin{lstlisting}[language=C++]
+if ((glyph[row] >> col) & 1) {
+    draw_rect(x + (col * scale), y + (row * scale), scale, scale, fg_color);
+}
+\end{lstlisting}
+By replacing a single \texttt{put\_pixel} call with a \texttt{draw\_rect} call, we added a \texttt{scale} parameter, allowing us to stretch the microscopic 8x8 font into 16x16 or 24x24 text so it is actually legible on a modern $1024 \times 768$ display. Finally, we updated our \texttt{draw\_string} loop to automatically handle newline characters (\texttt{\textbackslash n}) by resetting the X-coordinate and dropping the Y-coordinate.
+
+\subsection{Practical Applications of Primitives}
+With these drawing functions implemented, we transitioned from basic pixel manipulation to having the foundation for a complete Window Manager (GUI):
+\begin{itemize}
+    \item \textbf{Gradients:} Used for desktop backgrounds and premium window title bars to simulate depth.
+    \item \textbf{Lines:} Used to draw window borders, separators, and eventually wireframe 3D graphics or charts.
+    \item \textbf{Rectangles:} The core building block of the UI, used for window backgrounds, sidebars, and input fields.
+    \item \textbf{Circles:} Used for close/minimize/maximize window control buttons (similar to macOS), status indicator orbs, and rounded avatars.
+    \item \textbf{Bitmap Fonts:} Replaces the lost VGA hardware text mode, allowing us to render our command-line shell directly onto the graphical canvas and display file contents from the VFS.
+\end{itemize}
+
+\section{Phase 18: The Graphical Terminal}
+{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
+\subsection{Reviving the Shell}
+While the VESA graphics engine provided a canvas for shapes and fonts, the operating system's core text output---including the interactive shell, keyboard input, and system logs---was completely disconnected. The legacy \texttt{vga.cpp} driver was still blindly writing ASCII characters into the physical memory address \texttt{0xB8000}, which the GPU was completely ignoring in graphics mode. 
+
+Instead of rewriting every single print statement across the entire OS, we performed a surgical refactor of \texttt{kernel/vga.cpp}. We removed the \texttt{0xB8000} memory pointer entirely and replaced it with global graphical coordinates (\texttt{term\_x} and \texttt{term\_y}). 
+
+\subsection{Graphical Print Logic}
+We updated \texttt{vga\_print\_char} to act as a graphical terminal emulator using our new bitmap font renderer.
+\begin{itemize}
+    \item \textbf{Newline (\texttt{\textbackslash n}):} Resets \texttt{term\_x} to the left margin and increases \texttt{term\_y} by the scaled font height.
+    \item \textbf{Backspace (\texttt{\textbackslash b}):} Decrements \texttt{term\_x}, then draws a solid black rectangle over the previous coordinates to visually ``erase'' the character.
+    \item \textbf{Standard Characters:} Calls \texttt{draw\_char} to render the pixels, then increments \texttt{term\_x} to move the cursor to the right.
+\end{itemize}
+
+\subsection{Screen Paging}
+In VGA text mode, scrolling the screen simply meant shifting a 4KB array backwards. In VESA graphics mode, shifting millions of pixels is computationally expensive without hardware acceleration. To handle the cursor reaching the bottom of the screen, we implemented a simple ``pager'' mechanism. When \texttt{term\_y} exceeds the maximum vertical resolution, \texttt{vga\_clear()} is triggered, which draws a massive black rectangle over the entire terminal bounds and resets the cursor coordinates back to the top left.
+
+\section{Phase 19: The PS/2 Mouse Driver}
+{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
+\subsection{Hardware Initialization}
+To make Abyss OS truly interactive, we implemented a bare-metal driver for the PS/2 auxiliary device (the mouse). The PS/2 controller (Intel 8042 chip) requires a very specific initialization sequence sent to Port \texttt{0x64} (Command) and Port \texttt{0x60} (Data). We enabled the auxiliary port (\texttt{0xA8}), modified the configuration byte to enable IRQ 12, told the mouse to use default settings (\texttt{0xF6}), and finally enabled data reporting (\texttt{0xF4}).
+
+\subsection{The 3-Byte Packet State Machine}
+Unlike the keyboard which sends single scancodes, the PS/2 mouse transmits a 3-byte packet every time it moves. We hooked IRQ 12 (Interrupt 44) directly to our \texttt{isr44\_handler} in \texttt{mouse.cpp}. The handler acts as a state machine:
+\begin{itemize}
+    \item \textbf{Byte 0:} Contains sign bits and button states. (We also use Bit 3 to enforce synchronization).
+    \item \textbf{Byte 1:} The X-axis delta (movement left/right).
+    \item \textbf{Byte 2:} The Y-axis delta (movement up/down).
+\end{itemize}
+Because the PS/2 Y-axis is inverted relative to standard screen coordinates, we subtract the Y-delta from our global \texttt{mouse\_y} variable while adding the X-delta to \texttt{mouse\_x}.
+
+\subsection{Non-Destructive Cursor Rendering}
+A naive implementation of a cursor simply draws pixels at the mouse coordinates, which leaves a permanent ``smeared'' trail across the screen, destroying text and UI elements. 
+To build a professional, non-destructive pointer (a 10x15 pixel classic arrow), our interrupt handler executes a precise sequence on every movement:
+\begin{enumerate}
+    \item \textbf{Restore:} Repaint the original background pixels over the \textit{old} cursor coordinates using a saved buffer.
+    \item \textbf{Save:} Read the new background pixels at the \textit{new} coordinates using \texttt{get\_pixel()} and save them to the buffer.
+    \item \textbf{Draw:} Draw the pointer bitmap at the new coordinates.
+\end{enumerate}
+
+\appendix
+\section{Debugging Journal: Errors Encountered and Solutions}
+This appendix documents every major bug encountered during the development of Abyss OS, the symptoms that revealed them, and the exact fixes applied. It serves as a practical reference for common bare-metal programming mistakes.
+
+% ─────────────────────────────────────────────
+\subsection*{Phase 14--15: Multitasking \& Context Switching}
+
+\subsubsection*{Bug 1: Dereferencing the Stack Pointer Instead of Using Its Address}
+\textbf{Symptom:} Instant Page Fault on first context switch.\\
+\textbf{Root Cause:} In \texttt{create\_task}, the stack pointer was saved incorrectly:
+\begin{lstlisting}[language=C++]
+// WRONG: Reads the VALUE at the top of the stack (which is 0, a dummy register)
+new_task->esp = *stack;
+new_task->ebp = *stack;
+
+// CORRECT: Saves the MEMORY ADDRESS of the stack top
+new_task->esp = (uint32_t)stack;
+new_task->ebp = (uint32_t)stack;
+\end{lstlisting}
+Setting \texttt{esp = 0} pointed the new task's stack at the null pointer (address 0), causing an immediate fault when the CPU tried to \texttt{popa}.
+
+\subsubsection*{Bug 2: Wrong \texttt{extern} Declaration in Assembly}
+\textbf{Symptom:} NASM assembler error: \texttt{symbol `current\_task' not defined}.\\
+\textbf{Root Cause:} The \texttt{extern} line in \texttt{boot/interrupts.asm} was accidentally typed as \texttt{extern create\_task} instead of \texttt{extern current\_task}. The variable the assembly code needed was never declared visible to the assembler.
+
+\subsubsection*{Bug 3: Loading the Old Task's Stack Instead of the New Task's}
+\textbf{Symptom:} The context switch ran but immediately jumped back to the same task -- no actual switching occurred.\\
+\textbf{Root Cause:} In the assembly switch, \texttt{eax} holds the old task and \texttt{ebx} holds the new task. The stack restore used the wrong register:
+\begin{lstlisting}[language={[x86masm]Assembler}]
+; WRONG: Restores the OLD task's stack (no switch happens!)
+mov esp, [eax+4]
+mov ebp, [eax+8]
+
+; CORRECT: Restores the NEW task's stack
+mov esp, [ebx+4]
+mov ebp, [ebx+8]
+\end{lstlisting}
+
+\subsubsection*{Bug 4: Incorrect IRET Stack Frame for New Tasks}
+\textbf{Symptom:} Page Fault when switching to a brand-new task for the first time (never happened for already-running tasks).\\
+\textbf{Root Cause:} When a hardware interrupt fires, the CPU automatically pushes \texttt{EFLAGS}, \texttt{CS}, and \texttt{EIP} onto the stack before our assembly code runs. The handler ends with \texttt{iret} which pops all three. But the fake stack we created for new tasks only faked the \texttt{pusha} registers, not the IRET frame. The solution was to push three extra values before the registers:
+\begin{lstlisting}[language=C++]
+*(--stack) = 0x202; // EFLAGS (interrupts enabled)
+*(--stack) = 0x08;  // CS (Kernel Code Segment)
+*(--stack) = (uint32_t)main_function; // EIP
+// Then 8 dummy zeros for popa
+for (int i = 0; i < 8; i++) *(--stack) = 0;
+\end{lstlisting}
+
+% ─────────────────────────────────────────────
+\subsection*{Phase 16: Virtual File System}
+
+\subsubsection*{Bug 5: Missing Type on Static Variable}
+\textbf{Symptom:} Compiler error: \texttt{storage class specified for parameter}.\\
+\textbf{Root Cause:} The \texttt{file\_count} variable was declared without a type:
+\begin{lstlisting}[language=C++]
+static file_count = 0;   // WRONG: no type
+static uint32_t file_count = 0; // CORRECT
+\end{lstlisting}
+
+\subsubsection*{Bug 6: Using Wrong Field Name}
+\textbf{Symptom:} Compiler error: \texttt{fs\_node has no member named 'size'}.\\
+\textbf{Root Cause:} The field in \texttt{fs\_node} was named \texttt{length}, not \texttt{size}. The fix was simply \texttt{nodes[i].length = file\_size}.
+
+\subsubsection*{Bug 7: Casting to a Function Pointer Instead of a Struct Pointer}
+\textbf{Symptom:} Compiler error on the pointer arithmetic that advances to the next TAR block.\\
+\textbf{Root Cause:} A typo cast the pointer to the wrong type:
+\begin{lstlisting}[language=C++]
+hdr = (tarfs_read*)((char*)hdr + 512 + blocks * 512); // WRONG
+hdr = (tar_header*)((char*)hdr + 512 + blocks * 512); // CORRECT
+\end{lstlisting}
+
+\subsubsection*{Bug 8: Backwards \texttt{strcmp} Logic}
+\textbf{Symptom:} \texttt{initrd\_findfile("hello.txt")} always returned null even though the file was in the archive.\\
+\textbf{Root Cause:} The custom \texttt{strcmp} in this kernel returns \texttt{true} when strings are equal (opposite of the C standard which returns 0). The check was written with the wrong expectation:
+\begin{lstlisting}[language=C++]
+if (strcmp(nodes[i].name, file) == 0) // WRONG: true != 0
+if (strcmp(nodes[i].name, file))      // CORRECT: true is truthy
+\end{lstlisting}
+
+\subsubsection*{Bug 9: Missing \texttt{\#include} in Header File}
+\textbf{Symptom:} Compiler error: \texttt{fs\_node does not name a type} inside \texttt{initrd.h}.\\
+\textbf{Root Cause:} \texttt{initrd.h} used the \texttt{fs\_node} type without including the header that defined it. The fix was adding \texttt{\#include "vfs.h"} at the top of \texttt{initrd.h}.
+
+% ─────────────────────────────────────────────
+\subsection*{Phase 17: VESA Graphics}
+
+\subsubsection*{Bug 10: Framebuffer in Unmapped Virtual Memory (Silent Page Fault)}
+\textbf{Symptom:} Completely black screen. No pixels drawn. No error visible.\\
+\textbf{Root Cause:} This was the most subtle bug of the entire project. QEMU places the VESA linear framebuffer at physical address \texttt{0xFD000000}. However, the original \texttt{init\_paging()} only created one page table covering the first 4MB of RAM (\texttt{0x00000000}--\texttt{0x003FFFFF}). Every call to \texttt{put\_pixel} triggered a Page Fault because \texttt{0xFD000000} had no valid page table entry. The page fault handler ran invisibly (VGA text mode is ignored in graphics mode) and the kernel halted silently.\\
+\textbf{Solution:} Enable PSE (Page Size Extension) in \texttt{CR4} and replace the single page table with 1024 identity-mapped 4MB Big Page entries, covering the entire 4GB address space:
+\begin{lstlisting}[language=C++]
+void init_paging() {
+    // 0x83 = Present (1) + RW (2) + Page Size 4MB (0x80)
+    for (int i = 0; i < 1024; i++)
+        page_directory.tablesPhysical[i] = (i << 22) | 0x83;
+    load_page_directory(page_directory.tablesPhysical);
+    enable_paging();
+}
+\end{lstlisting}
+
+\subsubsection*{Bug 11: Black and White Stripes Instead of Colored Rectangle}
+\textbf{Symptom:} The screen displayed uniform alternating black and white vertical stripes instead of a solid colored rectangle.\\
+\textbf{Root Cause:} The \texttt{framebuffer\_addr} field in \texttt{multiboot\_info} is declared as \texttt{uint64\_t} (8 bytes). Passing it directly to \texttt{vesa\_init(uint32\_t addr, ...)} without an explicit cast caused the compiler to push two 32-bit words onto the stack. Inside the function, the parameters \texttt{width}, \texttt{height}, and \texttt{pitch} were all read from the wrong stack offsets. The \texttt{pitch} value received was completely wrong, making every row of pixels map to the wrong screen address.\\
+\textbf{Solution:} Explicit cast at the call site:
+\begin{lstlisting}[language=C++]
+vesa_init((uint32_t)mbd->framebuffer_addr,
+           mbd->framebuffer_width,
+           mbd->framebuffer_height,
+           mbd->framebuffer_pitch);
+\end{lstlisting}
+
+\subsubsection*{Bug 12: Grayscale Fade (Implicit Integer Promotion)}
+\textbf{Symptom:} When rendering a gradient from Crimson to Dark Purple, the screen instead drew a bizarre grayscale fade from Black to White.\\
+\textbf{Root Cause:} The formula \texttt{uint8\_t r = r1 + (((int)r2 - r1) * i) / h;} suffered from \textbf{Implicit Integer Promotion}. \texttt{i} and \texttt{h} were defined as \texttt{uint32\_t} (unsigned integers). If \texttt{r2} was darker than \texttt{r1}, the result of \texttt{r2 - r1} was a negative number. When C++ attempted to multiply this signed negative number by the unsigned \texttt{i}, it automatically converted the negative number into an unsigned format, wrapping it around into a massive positive number (e.g., 4,294,967,280). This overflowed the math completely.\\
+\textbf{Solution:} Explicitly cast the loop variables to signed integers before the math:
+\begin{lstlisting}[language=C++]
+uint8_t r = r1 + (((int)r2 - (int)r1) * (int)i) / (int)h;
+\end{lstlisting}
+
+\subsubsection*{Bug 13: The Infinite Text Loop}
+\textbf{Symptom:} The OS locked up completely when trying to print a string, freezing the Virtual Machine.\\
+\textbf{Root Cause:} The \texttt{draw\_string} function contained a \texttt{while(*str != '\textbackslash 0')} loop, but we forgot to increment the character pointer (\texttt{str++}) inside the loop. The CPU endlessly drew the exact same first letter on top of itself forever.\\
+\textbf{Solution:} Add \texttt{str++;} to the bottom of the loop.
+
+\subsubsection*{Bug 14: Text Drawing Off the Edge of the Screen}
+\textbf{Symptom:} Multi-line strings were drawn as one massive continuous horizontal line that shot completely off the right edge of the monitor.\\
+\textbf{Root Cause:} The text renderer had no logic to understand the newline character (\texttt{\textbackslash n}). It just treated it as an unprintable space, incremented \texttt{X}, and kept drawing to the right.\\
+\textbf{Solution:} Added a conditional check inside \texttt{draw\_string} to simulate a Carriage Return (reset X to starting margin) and a Line Feed (push Y down by the font height):
+\begin{lstlisting}[language=C++]
+if (*str == '\n') {
+    x = start_x;
+    y += (8 * scale);
+}
+\end{lstlisting}
+
+\subsubsection*{Bug 15: Font Array 'Not Declared'}
+\textbf{Symptom:} Compilation failed with the error: \texttt{error: 'font8x8' was not declared in this scope}.\\
+\textbf{Root Cause:} The standard open-source header file we downloaded named the array \texttt{font8x8\_basic}, but our \texttt{vesa.cpp} code attempted to reference it purely as \texttt{font8x8}.\\
+\textbf{Solution:} Changed the reference in \texttt{draw\_char} to match the header exactly: \texttt{font8x8\_basic[(uint8\_t)c][row]}.
+
+\subsubsection*{Bug 16: The Vertical Garbage Column (Missing Increment)}
+\textbf{Symptom:} The OS booted, but the first letter of a large message was replaced with a glitchy vertical line of garbled text running down the left side of the screen.\\
+\textbf{Root Cause:} In the newly refactored \texttt{vga\_print\_char}, we called \texttt{draw\_char(c, term\_x, term\_y, ...)} but forgot to increment \texttt{term\_x} afterwards. Every subsequent character printed by the OS was drawn at the exact same X and Y coordinate, stacking perfectly on top of each other and forming a solid glitch block.\\
+\textbf{Solution:} Added \texttt{term\_x += 8 * FONT\_SCALE;} immediately after drawing the character.
+
+\subsubsection*{Bug 17: Mixing Coordinate Spaces}
+\textbf{Symptom:} Text from \texttt{vga\_print} was drawing directly over the top of text printed by \texttt{draw\_string}, completely ignoring formatting.\\
+\textbf{Root Cause:} In \texttt{kernel\_main}, we called \texttt{draw\_string(..., 0, 0)} (which manages its own local X and Y variables) followed immediately by \texttt{vga\_print(...)} (which relies on the global \texttt{term\_x} and \texttt{term\_y} variables in \texttt{vga.cpp}). Because \texttt{draw\_string} did not update the global trackers, \texttt{vga\_print} assumed the cursor was still at `0, 0` and printed right over the previous string.\\
+\textbf{Solution:} Replaced the manual \texttt{draw\_string} call in \texttt{kernel\_main} with standard \texttt{vga\_print} calls so all text shares the same global cursor context.
+
+\subsubsection*{Bug 18: The Black Hole Terminal (Missing Reset)}
+\textbf{Symptom:} The terminal scrolled down normally, but once it hit the bottom of the screen, the screen flashed black and no more text was ever seen again.\\
+\textbf{Root Cause:} The \texttt{scroll()} function successfully detected that \texttt{term\_y} was off-screen and triggered \texttt{vga\_clear()}. \texttt{vga\_clear()} successfully drew a black rectangle to clear the screen, but it forgot to reset \texttt{term\_x} and \texttt{term\_y} back to 0. Consequently, \texttt{term\_y} remained off-screen indefinitely, meaning every subsequent character immediately triggered another invisible clear.\\
+\textbf{Solution:} Added \texttt{term\_x = TERM\_START\_X;} and \texttt{term\_y = TERM\_START\_Y;} to the bottom of \texttt{vga\_clear()}.
+
+\subsubsection*{Bug 19: The Top-Edge Magnetic Pinning}
+\textbf{Symptom:} The mouse cursor became permanently pinned to the very top edge of the screen (\texttt{Y = 0}) and refused to move down, although X-axis movement worked fine.\\
+\textbf{Root Cause:} The PS/2 packet sends movement deltas as 8-bit two's complement integers. We casted the raw byte to a \texttt{char}, but our C++ compiler configuration defaulted to treating \texttt{char} as an \textit{unsigned} 8-bit integer. When the mouse sent a negative delta (e.g., \texttt{-1} or \texttt{0xFF}), the compiler interpreted it as \texttt{+255}. Subtracting \texttt{255} from \texttt{mouse\_y} caused it to plunge instantly into the negatives, where our bounds-checking clamped it permanently at \texttt{0}.\\
+\textbf{Solution:} Explicitly cast the delta bytes to \texttt{int8\_t} to force standard sign-extension, allowing negative movements to be properly interpreted.
+
+\subsubsection*{Bug 20: Missing Interrupt Framework Abstraction}
+\textbf{Symptom:} Compilation failed with \texttt{isr.h: No such file or directory} when attempting to hook IRQ 12 using a generic \texttt{register\_interrupt\_handler} function.\\
+\textbf{Root Cause:} We attempted to use a generic interrupt registration abstraction commonly found in standard OS tutorials. However, Abyss OS utilizes a highly customized, direct-to-assembly IDT architecture for speed, meaning no such registry existed.\\
+\textbf{Solution:} Dropped the generic approach and directly wired \texttt{isr44} into \texttt{boot/interrupts.asm}, added the gate to \texttt{kernel/idt.cpp}, and exposed \texttt{extern "C" void isr44\_handler()} natively in \texttt{mouse.cpp}.
+
+\newpage
+
+\section{Phase 20: The Graphical User Interface \& Double Buffering}
+{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
+\subsection{The Double Buffering Architecture}
+When the mouse driver was first implemented, it wrote directly to the VESA video memory (\texttt{framebuffer}). This meant the driver had to manually save the background pixels before drawing the cursor, and restore them when the cursor moved. However, because the background was a complex gradient, overlapping movements caused pixel corruption.
+To solve this, we implemented Double Buffering. A 3.1 MB \texttt{backbuffer} was allocated on the heap. This exposed a critical memory bug: our initial bump allocator (\texttt{kmalloc}) was hard-capped at 4MB, and was never initialized in \texttt{kernel\_main}. We expanded the heap limit to 32MB and correctly initialized the memory subsystem. 
+All drawing functions (\texttt{put\_pixel}, \texttt{draw\_rect}) were refactored to draw to the backbuffer in software.
+
+\subsection{The Compositor Loop}
+A new \texttt{ui\_render()} function was created to act as a Compositor. Instead of the kernel sleeping permanently, the UI loop clears the backbuffer, draws the gradient, draws any active GUI Windows, draws the mouse cursor on top, and finally swaps the buffers to the screen using a blistering-fast inline assembly instruction: \texttt{rep movsl}.
+
+\section{Phase 21: The Interactive Desktop}
+{\small\textit{\textbf{Completed:} August 29, 2026}}\par\medskip
+\subsection{Click Detection and Z-Order Promotion}
+The PS/2 Mouse packet's first byte contains the button states. We extracted Bit 0 to track \texttt{mouse\_left\_pressed}. We introduced a \texttt{Window} struct to hold window coordinates, dimensions, and drag states.
+In the compositor loop, a reverse-iteration (Z-Order) collision detection was implemented. If the user clicks the title bar of a window, it is pulled from its current Z-index, shifted to the end of the rendering array (promoting it to the foreground), and its offset is recorded to allow smooth dragging without snapping to the cursor center.
+
+\newpage
+
+
+\section{Phase 22: The ATA Hard Drive Driver}
+{\small\textit{\textbf{Completed:} September 2, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+Before writing the driver, we must understand the core technologies governing physical hard drives in legacy systems:
+\begin{itemize}
+    \item \textbf{ATA (Advanced Technology Attachment):} The standard physical interface used to connect storage devices (Hard Drives, CD-ROMs) to the PC motherboard.
+    \item \textbf{PIO (Programmed Input/Output):} A data transmission method where the CPU itself must manually execute an instruction (like \texttt{inw} or \texttt{outw}) to transfer every single byte of data between the hardware and RAM. While slower than modern DMA (Direct Memory Access), it is the most reliable baseline for storage drivers.
+    \item \textbf{LBA (Logical Block Addressing):} Instead of addressing data physically by Cylinder, Head, and Sector (CHS), LBA abstracts the drive into a flat array of 512-byte blocks. We use LBA28, which uses a 28-bit address, allowing the OS to access up to 128 GB of storage.
+\end{itemize}
+
+\subsection{The Objective}
+Our objective in this phase was to break free from the read-only constraints of the Initial Ramdisk (Initrd). We needed to:
+\begin{enumerate}
+    \item Generate a virtual 64MB raw image file (\texttt{disk.img}) and attach it to QEMU as the Primary Master drive.
+    \item Implement hardware-accelerated 16-bit port I/O to read and write entire 512-byte sectors.
+    \item Write an ATA PIO driver to permanently etch a message onto the magnetic disk, and verify it via a hexadecimal dump on the host machine.
+\end{enumerate}
+
+\subsection{Implementation \& Bug Resolution}
+Because hard drives process data in 512-byte sectors (256 16-bit words), relying on our standard 8-bit \texttt{inb} port reader would be highly inefficient. We expanded \texttt{io.h} to include the x86 \texttt{rep insw} and \texttt{rep outsw} inline assembly instructions, allowing the CPU to blast 16-bit words directly between the IDE controller and system memory at maximum hardware speeds.
+
+The ATA driver sends the 28-bit LBA sector address across ports \texttt{0x1F3} through \texttt{0x1F6}, and sends the READ (\texttt{0x20}) or WRITE (\texttt{0x30}) command to \texttt{0x1F7}. 
+
+During testing, a critical interrupt conflict was discovered: when the ATA controller finishes a write command, it fires IRQ 14 (Interrupt 46). Since our IDT lacked an \texttt{isr46} handler, the OS crashed immediately after the disk write. Because our driver uses polling (waiting for \texttt{BSY} and \texttt{DRQ} flags rather than using interrupts), we elegantly resolved the crash by setting the \texttt{nIEN} (No Interrupt Enable) bit in the Device Control Register (\texttt{0x3F6}), instructing the hard drive to remain silent after finishing commands. 
+
+\newpage
+
+\section{Phase 23: The FAT32 File System}
+{\small\textit{\textbf{Completed:} September 6, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+Reading raw bytes from a hard drive using LBA sectors is only half the battle. To provide a usable operating system, we must implement a standard File System. We chose \textbf{FAT32} (File Allocation Table 32-bit), originally introduced in Windows 95 OSR2, because it is the most widely supported legacy file system and remains the standard for USB flash drives today.
+
+A FAT32 volume consists of several key regions:
+\begin{itemize}
+    \item \textbf{VBR (Volume Boot Record):} Located at Sector 0 of the partition. It contains crucial metadata about the file system, including the number of sectors per cluster and the location of the Root Directory.
+    \item \textbf{FAT (File Allocation Table):} A massive array of 32-bit integers that act as a linked list. It tracks which clusters belong to which files, allowing files to be fragmented across the physical disk.
+    \item \textbf{Data Region:} The actual sectors where file contents and directories are stored, organized into "Clusters" (blocks of contiguous sectors).
+\end{itemize}
+
+\subsection{The Objective}
+The goal of this phase was to teach Abyss OS to parse the FAT32 VBR and read the Root Directory. We needed to format our virtual \texttt{disk.img} as a FAT32 volume, inject a test file from the Linux host machine, and successfully print the name of that file to the Abyss OS screen.
+
+\subsection{Implementation \& Structure Alignment}
+We utilized the Linux \texttt{mtools} utility (\texttt{mformat} and \texttt{mcopy}) to format \texttt{disk.img} and inject \texttt{HELLO.TXT} without requiring root privileges. 
+
+To parse the VBR, we had to ensure our C++ \texttt{FAT32\_VBR} structure perfectly matched the physical byte layout on the disk. Because C++ compilers often optimize structures by injecting invisible "padding bytes" to align variables to 4-byte memory boundaries, reading 512 raw bytes directly into a standard struct would result in misaligned garbage data. 
+
+To solve this, we used compiler directives to force exact physical byte alignment:
+\begin{lstlisting}[language=C++]
+#pragma pack(push, 1) // Instructs compiler to pack variables tightly (1-byte alignment)
+
+struct FAT32_VBR { ... };
+struct FAT32_DirectoryEntry { ... };
+
+#pragma pack(pop)     // Restores normal compiler alignment optimizations
+\end{lstlisting}
+
+By casting the 512 bytes from Sector 0 into the \texttt{FAT32\_VBR} pointer, the kernel successfully dynamically calculated the LBA of the Root Directory cluster. It then loaded the Root Directory into memory, cast the buffer into an array of 32-byte \texttt{FAT32\_DirectoryEntry} structures, filtered out deleted or hidden files, and successfully rendered the \texttt{HELLO.TXT} filename to the GUI.
+
+\newpage
+
+\section{Phase 24: Reading FAT32 Clusters}
+{\small\textit{\textbf{Completed:} September 20, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+In Phase 23, we parsed the Root Directory and found the 32-byte metadata entry for \texttt{HELLO.TXT}. However, a FAT32 directory entry only stores the \textit{starting cluster} of a file. It does not tell you where the rest of the file is located! 
+
+Because operating systems constantly create, delete, and resize files, files are rarely stored in contiguous blocks on the hard drive. Instead, they are fragmented. To reconstruct a fragmented file, FAT32 uses the \textbf{File Allocation Table (FAT)}. The FAT is a massive array of 32-bit integers that acts as a linked list mapping out the physical disk.
+
+\subsection{The Objective}
+The goal of this phase was to write a cluster traversal algorithm that could query the FAT table, follow a file's linked list chain across the physical disk, extract the raw data sectors into RAM, and reconstruct the complete \texttt{HELLO.TXT} string inside the Abyss OS environment.
+
+\subsection{Implementation: Traversing the Chain}
+Because the FAT table itself is stored on the hard drive, looking up a cluster requires a disk read. We implemented \texttt{fat32\_get\_next\_cluster(current\_cluster)}, which performs the following calculations:
+\begin{enumerate}
+    \item \textbf{Sector Offset:} Since 1 sector is 512 bytes, and each FAT entry is 4 bytes (32-bit), there are exactly 128 entries per sector. We divide the cluster ID by 128 to find which physical sector of the FAT table to read.
+    \item \textbf{Byte Offset:} We take the cluster ID modulo 128 and multiply by 4 to find the exact byte offset of the entry inside that sector.
+\end{enumerate}
+
+After reading the FAT sector via the ATA driver, the 32-bit integer is extracted. Because FAT32 only uses 28 bits, the top 4 bits are masked out (\texttt{0x0FFFFFFF}). This value is the next cluster in the file's chain. A value of \texttt{0x0FFFFFF8} or higher signifies the End-of-File (EOF).
+
+We successfully integrated this logic into \texttt{fat32\_read\_file}, which allocates a buffer, reads the data clusters, and dynamically follows the FAT chain until EOF is reached. Our testing proved flawless: Abyss OS allocated 2KB of RAM, read the fragmented clusters, and rendered the internal text of \texttt{HELLO.TXT} directly to the GUI!
+
+\newpage
+
+\section{Phase 25: The Graphical File Explorer}
+{\small\textit{\textbf{Completed:} September 20, 2026}}\par\medskip
+
+\subsection{Theoretical Background}
+In modern operating systems, the file system backend and the graphical user interface (GUI) frontend are completely separate subsystems. The GUI relies on a robust API to query the file system for directory entries and data. Up until this point, Abyss OS had only tested the FAT32 driver by printing text directly to the screen via a blocking \texttt{while(1)} loop.
+
+\subsection{The Objective}
+The goal of this phase was to construct Abyss OS's first native, data-driven graphical application. We needed to integrate the FAT32 driver directly into the window manager, allowing a "File Explorer" window to dynamically query the hard drive and render its contents as graphical elements on the screen.
+
+\subsection{Implementation: Building the App}
+To decouple the backend from the frontend, we introduced a new API function in \texttt{kernel/fat32.cpp}: \texttt{fat32\_get\_root\_entries()}. This function queries the FAT32 root directory on the physical disk and populates an array of \texttt{FAT32\_DirectoryEntry} structures, abstracting away the low-level ATA sector reads from the GUI.
+
+In the window manager (\texttt{kernel/ui.cpp}), we expanded our global \texttt{windows} array to include a third application: "File Explorer". During the primary \texttt{ui\_render()} loop, if the renderer detects it is drawing the File Explorer window, it executes custom application logic:
+\begin{enumerate}
+    \item It clears the interior of the window with a solid white background.
+    \item It calls the \texttt{fat32\_get\_root\_entries()} API to fetch the current files from the hard drive.
+    \item It loops through each returned file, utilizing our primitive graphics functions to draw a blue icon (\texttt{draw\_rect}) and render the 8.3 filename (\texttt{draw\_string}) directly into the application's coordinate space.
+\end{enumerate}
+
+This successfully demonstrated a true OS architecture: a hardware driver providing abstracted data to a high-level graphical window manager!
+
+\newpage
+\section{Complete Source Code}
+
+\subsection{Makefile}
+\begin{lstlisting}[language={bash}]
+CC = i686-elf-g++
+ASM = nasm
+LD = i686-elf-ld
+
+CFLAGS = -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti
+LDFLAGS = -T linker.ld -ffreestanding -O2 -nostdlib
+
+all: abyss.iso
+
+boot/boot.o: boot/boot.asm
+	$(ASM) -f elf32 boot/boot.asm -o boot/boot.o
+
+boot/gdt_flush.o: boot/gdt_flush.asm
+	$(ASM) -f elf32 boot/gdt_flush.asm -o boot/gdt_flush.o
+
+boot/idt_flush.o: boot/idt_flush.asm
+	$(ASM) -f elf32 boot/idt_flush.asm -o boot/idt_flush.o
+
+boot/interrupts.o: boot/interrupts.asm
+	$(ASM) -f elf32 boot/interrupts.asm -o boot/interrupts.o
+
+boot/paging.o: boot/paging.asm
+	$(ASM) -f elf32 boot/paging.asm -o boot/paging.o
+
+boot/usermode.o: boot/usermode.asm
+	$(ASM) -f elf32 boot/usermode.asm -o boot/usermode.o
+
+boot/task.o: boot/task.asm
+	$(ASM) -f elf32 boot/task.asm -o boot/task.o
+
+kernel/kernel.o: kernel/kernel.cpp
+	$(CC) $(CFLAGS) -c kernel/kernel.cpp -o kernel/kernel.o
+
+kernel/gdt.o: kernel/gdt.cpp
+	$(CC) $(CFLAGS) -c kernel/gdt.cpp -o kernel/gdt.o
+
+kernel/idt.o: kernel/idt.cpp
+	$(CC) $(CFLAGS) -c kernel/idt.cpp -o kernel/idt.o
+
+kernel/vga.o: kernel/vga.cpp
+	$(CC) $(CFLAGS) -c kernel/vga.cpp -o kernel/vga.o
+
+kernel/isr.o: kernel/isr.cpp
+	$(CC) $(CFLAGS) -c kernel/isr.cpp -o kernel/isr.o
+
+kernel/pic.o: kernel/pic.cpp
+	$(CC) $(CFLAGS) -c kernel/pic.cpp -o kernel/pic.o
+
+kernel/paging.o: kernel/paging.cpp	
+	$(CC) $(CFLAGS) -c kernel/paging.cpp -o kernel/paging.o
+
+kernel/string.o: kernel/string.cpp
+	$(CC) $(CFLAGS) -c kernel/string.cpp -o kernel/string.o
+
+kernel/tss.o: kernel/tss.cpp
+	$(CC) $(CFLAGS) -c kernel/tss.cpp -o kernel/tss.o
+
+kernel/memory.o: kernel/memory.cpp
+	$(CC) $(CFLAGS) -c kernel/memory.cpp -o kernel/memory.o
+
+kernel/timer.o: kernel/timer.cpp
+	$(CC) $(CFLAGS) -c kernel/timer.cpp -o kernel/timer.o 
+
+kernel/task.o: kernel/task.cpp
+	$(CC) $(CFLAGS) -c kernel/task.cpp -o kernel/task.o
+
+kernel/vfs.o: kernel/vfs.cpp
+	$(CC) $(CFLAGS) -c kernel/vfs.cpp -o kernel/vfs.o 
+
+kernel/initrd.o: kernel/initrd.cpp
+	$(CC) $(CFLAGS) -c kernel/initrd.cpp -o kernel/initrd.o 
+
+kernel/vesa.o: kernel/vesa.cpp
+	$(CC) $(CFLAGS) -c kernel/vesa.cpp -o kernel/vesa.o
+
+kernel/mouse.o: kernel/mouse.cpp
+	$(CC) $(CFLAGS) -c kernel/mouse.cpp -o kernel/mouse.o 
+
+kernel/ui.o: kernel/ui.cpp
+	$(CC) $(CFLAGS) -c kernel/ui.cpp -o kernel/ui.o
+
+kernel/ata.o: kernel/ata.cpp
+	$(CC) $(CFLAGS) -c kernel/ata.cpp -o kernel/ata.o
+
+kernel/fat32.o: kernel/fat32.cpp
+	$(CC) $(CFLAGS) -c kernel/fat32.cpp -o kernel/fat32.o 
+
+abyss.bin: boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o kernel/fat32.o
+	$(CC) $(LDFLAGS) -o abyss.bin boot/boot.o kernel/kernel.o boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o kernel/fat32.o
+
+abyss.iso: abyss.bin
+	cp abyss.bin iso/boot/abyss.bin
+	cd initrd && tar --format=ustar -cvf ../iso/boot/initrd.tar *
+	grub-mkrescue -o abyss.iso iso
+
+run: abyss.iso
+# 	qemu-system-i386 -cdrom abyss.iso
+	qemu-system-i386 -hda disk.img -cdrom abyss.iso -boot d -vga std
+
+clean:
+	rm -f boot/boot.o kernel/kernel.o abyss.bin abyss.iso iso/boot/abyss.bin boot/gdt_flush.o boot/idt_flush.o boot/interrupts.o boot/paging.o kernel/gdt.o kernel/idt.o kernel/vga.o kernel/isr.o kernel/pic.o kernel/paging.o kernel/string.o boot/usermode.o kernel/tss.o kernel/memory.o kernel/timer.o kernel/task.o boot/task.o kernel/vfs.o kernel/initrd.o kernel/vesa.o kernel/mouse.o kernel/ui.o kernel/ata.o kernel/fat32.o
+
+\end{lstlisting}
+
+\subsection{boot.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+MAGIC    equ 0x1BADB002
+FLAGS    equ 0x04
+CHECKSUM equ -(MAGIC + FLAGS)
+
+section .multiboot
+align 4
+    dd MAGIC
+    dd FLAGS
+    dd CHECKSUM
+    dd 0, 0, 0, 0, 0
+    dd 0
+    dd 1024
+    dd 768
+    dd 32
+
+section .bss
+align 16
+stack_bottom:
+    resb 16384      ; reserve 16 KB
+stack_top:
+
+section .text
+global _start
+extern kernel_main
+
+_start:
+    mov esp, stack_top
+    push ebx
+    call kernel_main
+    cli
+.hang:
+    hlt
+    jmp .hang
+
+\end{lstlisting}
+
+\subsection{gdt\_flush.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+global gdt_flush
+section .text
+gdt_flush:
+    mov eax, [esp+4]
+    lgdt [eax]
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    jmp 0x08:.flush
+    .flush:
+        ret
+\end{lstlisting}
+
+\subsection{idt\_flush.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+global idt_flush
+section .text
+idt_flush:
+    mov eax, [esp+4]
+    lidt [eax]
+    ret
+\end{lstlisting}
+
+\subsection{interrupts.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+section .text
+
+; --- MACROS TO GENERATE 32 EXCEPTION HANDLERS ---
+%macro ISR_NOERRCODE 1
+  global isr%1
+  isr%1:
+    push 0   
+    push %1 
+    jmp isr_common_stub
+%endmacro
+
+%macro ISR_ERRCODE 1
+  global isr%1
+  isr%1:
+    push %1
+    jmp isr_common_stub
+%endmacro
+
+; Generate ISR 0 to 31
+ISR_NOERRCODE 0
+ISR_NOERRCODE 1
+ISR_NOERRCODE 2
+ISR_NOERRCODE 3
+ISR_NOERRCODE 4
+ISR_NOERRCODE 5
+ISR_NOERRCODE 6
+ISR_NOERRCODE 7
+ISR_ERRCODE   8
+ISR_NOERRCODE 9
+ISR_ERRCODE   10
+ISR_ERRCODE   11
+ISR_ERRCODE   12
+ISR_ERRCODE   13
+ISR_ERRCODE   14
+ISR_NOERRCODE 15
+ISR_NOERRCODE 16
+ISR_ERRCODE   17
+ISR_NOERRCODE 18
+ISR_NOERRCODE 19
+ISR_NOERRCODE 20
+ISR_NOERRCODE 21
+ISR_NOERRCODE 22
+ISR_NOERRCODE 23
+ISR_NOERRCODE 24
+ISR_NOERRCODE 25
+ISR_NOERRCODE 26
+ISR_NOERRCODE 27
+ISR_NOERRCODE 28
+ISR_NOERRCODE 29
+ISR_NOERRCODE 30
+ISR_NOERRCODE 31
+ISR_NOERRCODE 128
+
+; Send EOI (IRQ 12) to the PIC!
+; --- THE COMMON C++ CALLER ---
+extern fault_handler
+
+isr_common_stub:
+    pusha        ; Save all registers
+    push esp     ; Pass a pointer to the stack to our C++ function!
+    call fault_handler
+    add esp, 4   ; Clean up the pointer we just pushed
+    popa         ; Restore registers
+    add esp, 8   ; Clean up the pushed error code and pushed ISR number
+    iret
+
+; --- Interrupt 32 (Timer IRQ0) ---
+global isr32
+extern isr32_handler
+extern current_task
+isr32:
+    pusha
+    call isr32_handler
+
+    mov eax, [current_task]
+    mov [eax+4], esp
+    mov [eax+8], ebp
+    
+    mov ebx, [eax+16]
+    mov [current_task], ebx
+
+    mov esp, [ebx+4]
+    mov ebp, [ebx+8]
+
+    popa
+    iret
+
+; --- Interrupt 33 (Keyboard IRQ1) ---
+global isr33
+extern isr33_handler
+isr33:
+    pusha
+    call isr33_handler
+    popa
+    iret
+
+global isr44
+extern isr44_handler
+isr44:
+    pusha
+    call isr44_handler
+    popa
+    iret
+
+\end{lstlisting}
+
+\subsection{paging.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+global load_page_directory
+global enable_paging
+
+section .text
+
+; void load_page_directory(uint32_t* pointer)
+load_page_directory:
+    push ebp
+    mov ebp, esp
+    
+    mov eax, [ebp+8]   ; Grab the pointer we passed from C++
+    mov cr3, eax       ; Load it into the magical CR3 register
+    
+    mov esp, ebp
+    pop ebp
+    ret
+
+; void enable_paging()
+enable_paging:
+    push ebp
+    mov ebp, esp
+    ; Enable PSE (Page Size Extension) so we can use 4MB pages
+    mov eax, cr4
+    or  eax, 0x10 
+    mov cr4, eax
+
+    mov eax, cr0
+    or eax, 0x80000000 ; Flip the 31st bit (the Paging Bit) to 1
+    mov cr0, eax       ; Push it back into the CPU! (Paging turns ON right here)
+    
+    mov esp, ebp
+    pop ebp
+    ret
+
+\end{lstlisting}
+
+\subsection{task.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+section .text
+
+global perform_task_switch
+extern current_task
+
+perform_task_switch:
+    ; 1. Save the CURRENT task's state onto its own stack!
+    pushf           ; Push EFLAGS register
+    pusha           ; Push all 8 general purpose registers
+    
+    ; 2. Get the pointer to the current_task struct in memory
+    mov eax, [current_task]
+    
+    ; 3. Save the current stack pointers into the struct!
+    ; (id is at offset 0. esp is at offset 4. ebp is at offset 8)
+    mov [eax+4], esp
+    mov [eax+8], ebp
+    
+    ; 4. Move to the next task in the linked list
+    ; (next is at offset 16, assuming eip is still at offset 12 in your struct!)
+    mov ebx, [eax+16]
+    mov [current_task], ebx
+    
+    ; 5. THE SWITCH! Load the NEW task's stack pointers into the CPU!
+    mov esp, [ebx+4]
+    mov ebp, [ebx+8]
+    
+    ; 6. Restore the NEW task's state from its own stack!
+    popa            ; Pop all 8 general purpose registers
+    popf            ; Pop EFLAGS register
+    
+    ; 7. Because C++ called this function, 'ret' automatically pops the 
+    ;    Instruction Pointer (EIP) off the stack and jumps to it!
+    ret
+
+\end{lstlisting}
+
+\subsection{usermode.asm}
+\begin{lstlisting}[language={[x86masm]Assembler}]
+global jump_usermode
+extern test_user_function ; This is a C++ function we will write next!
+
+section .text
+jump_usermode:
+    cli  ; Turn off hardware interrupts so we don't crash while building the fake stack
+
+    ; 1. Set the Data Segment registers to our new Ring 3 Data GDT Entry
+    ; (Our entry is 0x20. We add 3 to tell the CPU it is Ring 3 -> 0x23)
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; 2. Build the fake interrupt stack!
+    push 0x23                ; SS (Stack Segment)
+    push esp                 ; ESP (We'll just reuse the current stack)
+    pushf                    ; EFLAGS (Push current flags)
+    push 0x1B                ; CS (Ring 3 Code Entry is 0x18 + 3 = 0x1B)
+    push test_user_function  ; EIP (The C++ function we want to run in Ring 3!)
+
+    ; 3. Execute the fake return!
+    iret
+
+\end{lstlisting}
+
+\subsection{hello.txt}
+\begin{lstlisting}[language={bash}]
+Greetings from the Abyss' Virtual file system, mortal!!
+
+\end{lstlisting}
+
+\subsection{help.txt}
+\begin{lstlisting}[language={bash}]
+"These are the helping commands mortal :\n 1. clear\n 2. hail\n 3. alloc/malloc\n 4. uptime\n 5. cat <filename>\n 6. help\n 7. ls\n"
+
+\end{lstlisting}
+
+\subsection{ata.cpp}
+\begin{lstlisting}[language={C++}]
+#include "ata.h"
+#include "io.h"
+
+#define ATA_DATA        0x1F0
+#define ATA_SECTOR_CNT  0x1F2
+#define ATA_LBA_LOW     0x1F3
+#define ATA_LBA_MID     0x1F4
+#define ATA_LBA_HIGH    0x1F5
+#define ATA_DRIVE       0x1F6
+#define ATA_COMMAND     0x1F7
+#define ATA_STATUS      0x1F7
+
+#define ATA_CMD_READ_PIO  0x20
+#define ATA_CMD_WRITE_PIO 0x30
+
+#define ATA_SR_BSY     0x80    
+#define ATA_SR_DRQ     0x08 
+
+void ata_wait_bsy(){
+    while(inb(ATA_STATUS) & ATA_SR_BSY);
+}
+
+void ata_wait_drq(){
+    while(!(inb(ATA_STATUS) & ATA_SR_DRQ));
+}
+
+void ata_init(){
+    outb(0x3F6, 0x02);
+}
+
+void ata_read_sector(uint32_t lba, uint8_t* buf){
+    ata_wait_bsy();
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_SECTOR_CNT, 1);
+    outb(ATA_LBA_LOW, (uint8_t)lba);
+    outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HIGH, (uint8_t)(lba >> 16));
+
+    outb(ATA_COMMAND, ATA_CMD_READ_PIO);
+    ata_wait_bsy();
+    ata_wait_drq();
+
+    insw(ATA_DATA, buf, 256);
+}
+
+void ata_write_sector(uint32_t lba, uint8_t* buffer) {
+    ata_wait_bsy();
+    
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_SECTOR_CNT, 1);
+    outb(ATA_LBA_LOW, (uint8_t)lba);
+    outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HIGH, (uint8_t)(lba >> 16));
+    
+    outb(ATA_COMMAND, ATA_CMD_WRITE_PIO);
+    
+    ata_wait_bsy();
+    ata_wait_drq();
+    
+    outsw(ATA_DATA, buffer, 256);
+    ata_wait_bsy();
+    outb(ATA_COMMAND, 0xE7); 
+    ata_wait_bsy();
+}
+\end{lstlisting}
+
+\subsection{ata.h}
+\begin{lstlisting}[language={C++}]
+#pragma once 
+#include <stdint.h>
+
+void ata_init();
+void ata_read_sector(uint32_t lba, uint8_t* buf);
+void ata_write_sector(uint32_t lba, uint8_t* buf);
+\end{lstlisting}
+
+\subsection{fat32.cpp}
+\begin{lstlisting}[language={C++}]
+#include "fat32.h"
+#include "ata.h"
+#include "vga.h"
+
+uint32_t fat_start_sector = 0;
+uint32_t data_start_sector = 0;
+uint32_t root_dir_cluster = 0;
+uint8_t  sectors_per_cluster = 0;
+
+// Converts a FAT32 Cluster Number into a physical ATA LBA Sector Number
+uint32_t cluster_to_lba(uint32_t cluster) {
+    return data_start_sector + ((cluster - 2) * sectors_per_cluster);
+}
+bool str_match(const char* str1, const char* str2, int len) {
+    for (int i = 0; i < len; i++) {
+        if (str1[i] != str2[i]) return false;
+    }
+    return true;
+}
+
+void fat32_init() {
+    uint8_t boot_sector[512];
+    ata_read_sector(0, boot_sector); // Read LBA 0
+    
+    FAT32_VBR* vbr = (FAT32_VBR*)boot_sector;
+    
+    // Check if it's actually FAT32
+    if (vbr->boot_signature != 0xAA55) {
+        vga_print("Error: Disk is not FAT32 formatted!\n");
+        return;
+    }
+    
+    sectors_per_cluster = vbr->sectors_per_cluster;
+    root_dir_cluster = vbr->root_cluster;
+    
+    // Calculate memory regions
+    fat_start_sector = vbr->reserved_sectors;
+    uint32_t fat_size = vbr->sectors_per_fat_32;
+    data_start_sector = fat_start_sector + (vbr->fat_count * fat_size);
+    
+    vga_print("FAT32 Init Success! Sys ID: ");
+    for(int i=0; i<8; i++) vga_print_char(vbr->sys_identifier[i]);
+    vga_print("\n");
+}
+
+void fat32_list_root() {
+    uint8_t root_buffer[512];
+    uint32_t root_lba = cluster_to_lba(root_dir_cluster);
+    
+    // Read the first sector of the root directory
+    ata_read_sector(root_lba, root_buffer);
+    
+    FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)root_buffer;
+    
+    // A 512-byte sector holds exactly sixteen 32-byte directory entries (512 / 32 = 16)
+    for (int i = 0; i < 16; i++) {
+        FAT32_DirectoryEntry* entry = &entries[i];
+        
+        // 0x00 means the rest of the directory is empty
+        if (entry->name[0] == 0x00) break;
+        
+        // 0xE5 means the file was deleted, skip it
+        if ((unsigned char)entry->name[0] == 0xE5) continue;
+        
+        // Skip hidden files, system files, and long-filename entries (0x0F)
+        if (entry->attributes == 0x0F || (entry->attributes & 0x02) || (entry->attributes & 0x04)) continue;
+        
+        // Print the short filename!
+        vga_print("Found File: ");
+        for(int j=0; j<8; j++) if(entry->name[j] != ' ') vga_print_char(entry->name[j]);
+        vga_print_char('.');
+        for(int j=0; j<3; j++) if(entry->ext[j] != ' ') vga_print_char(entry->ext[j]);
+        vga_print("\n");
+    }
+}
+uint32_t fat32_get_next_cluster(uint32_t current_cluster) {
+    // 1 Sector = 512 Bytes. Each FAT entry is 4 Bytes (32 bits). 
+    // Therefore, there are exactly 128 FAT entries per sector!
+    uint32_t fat_sector = fat_start_sector + (current_cluster / 128);
+    uint32_t fat_offset = (current_cluster % 128) * 4;
+    
+    uint8_t sector_buffer[512];
+    ata_read_sector(fat_sector, sector_buffer);
+    
+    // Read the 32-bit FAT entry
+    uint32_t next_cluster = *((uint32_t*)&sector_buffer[fat_offset]);
+    
+    // Mask out the top 4 bits (since it's FAT32, only 28 bits are used)
+    return next_cluster & 0x0FFFFFFF; 
+}
+
+bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* out_buffer) {
+    uint8_t root_buffer[512];
+    uint32_t root_lba = cluster_to_lba(root_dir_cluster);
+    ata_read_sector(root_lba, root_buffer);
+    
+    FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)root_buffer;
+    uint32_t file_cluster = 0;
+    
+    // 1. Search the Root Directory for the file
+    for (int i = 0; i < 16; i++) {
+        FAT32_DirectoryEntry* entry = &entries[i];
+        if (entry->name[0] == 0x00) break;
+        if ((unsigned char)entry->name[0] == 0xE5) continue;
+        if (entry->attributes == 0x0F || (entry->attributes & 0x08)) continue;
+        
+        // We use strict 8.3 FAT32 string matching
+        if (str_match(entry->name, target_name, 8) && str_match(entry->ext, target_ext, 3)) {
+            // Found it! Combine the high and low 16-bit halves to get the 32-bit starting cluster
+            file_cluster = ((uint32_t)entry->first_cluster_high << 16) | entry->first_cluster_low;
+            break;
+        }
+    }
+    
+    if (file_cluster == 0) {
+        vga_print("Error: File not found!\n");
+        return false;
+    }
+    
+    // 2. Read the file, cluster by cluster
+    uint32_t current_cluster = file_cluster;
+    int buffer_offset = 0;
+    
+    // A cluster value of 0x0FFFFFF8 or higher means "End of File"
+    while (current_cluster < 0x0FFFFFF8) { 
+        uint32_t lba = cluster_to_lba(current_cluster);
+        
+        // Read all sectors in this cluster (mtools formats use 1 sector per cluster for tiny disks)
+        for (int i = 0; i < sectors_per_cluster; i++) {
+            ata_read_sector(lba + i, &out_buffer[buffer_offset]);
+            buffer_offset += 512;
+        }
+        
+        // Find the next cluster from the FAT table
+        current_cluster = fat32_get_next_cluster(current_cluster);
+    }
+    
+    return true;
+}
+int fat32_get_root_entries(FAT32_DirectoryEntry* out_buffer, int max_entries) {
+    uint8_t root_buffer[512];
+    uint32_t root_lba = cluster_to_lba(root_dir_cluster);
+    ata_read_sector(root_lba, root_buffer);
+    
+    FAT32_DirectoryEntry* entries = (FAT32_DirectoryEntry*)root_buffer;
+    int found_count = 0;
+    
+    for (int i = 0; i < 16; i++) {
+        FAT32_DirectoryEntry* entry = &entries[i];
+        if (entry->name[0] == 0x00) break;
+        if ((unsigned char)entry->name[0] == 0xE5) continue;
+        if (entry->attributes == 0x0F || (entry->attributes & 0x08)) continue;
+        
+        if (found_count < max_entries) {
+            out_buffer[found_count] = *entry;
+            found_count++;
+        }
+    }
+    
+    return found_count;
+}
+
+\end{lstlisting}
+
+\subsection{fat32.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+// Packed ensures the compiler doesn't add padding between variables!
+// #pragma pack(push, 1)
+
+// The FAT32 Volume Boot Record (VBR) located at Sector 0
+struct FAT32_VBR {
+    uint8_t  jump[3];
+    char     oem_name[8];
+    uint16_t bytes_per_sector;      // Usually 512
+    uint8_t  sectors_per_cluster;
+    uint16_t reserved_sectors;      // Boot record sectors before the FAT
+    uint8_t  fat_count;             // Number of FATs (usually 2)
+    uint16_t dir_entries;           // Unused in FAT32 (0)
+    uint16_t total_sectors_16;      // Unused in FAT32 (0)
+    uint8_t  media_descriptor;
+    uint16_t sectors_per_fat_16;    // Unused in FAT32 (0)
+    uint16_t sectors_per_track;
+    uint16_t heads;
+    uint32_t hidden_sectors;
+    uint32_t total_sectors_32;      // Total sectors in volume
+    
+    // FAT32 Extended Boot Record
+    uint32_t sectors_per_fat_32;    // Size of the FAT in sectors
+    uint16_t flags;
+    uint16_t fat_version;
+    uint32_t root_cluster;          // Usually cluster 2
+    uint16_t fsinfo_cluster;
+    uint16_t backup_boot_sector;
+    uint8_t  reserved[12];
+    uint8_t  drive_number;
+    uint8_t  nt_flags;
+    uint8_t  signature;             // 0x28 or 0x29
+    uint32_t serial_number;
+    char     label[11];
+    char     sys_identifier[8];     // "FAT32   "
+    uint8_t  boot_code[420];
+    uint16_t boot_signature;        // 0xAA55
+}__attribute__((packed));
+
+// A 32-byte FAT32 Directory Entry
+struct FAT32_DirectoryEntry {
+    char     name[8];               // Short filename (e.g., "HELLO   ")
+    char     ext[3];                // Extension (e.g., "TXT")
+    uint8_t  attributes;            // File, Directory, Hidden, Read-Only, etc.
+    uint8_t  reserved;
+    uint8_t  creation_time_tenths;
+    uint16_t creation_time;
+    uint16_t creation_date;
+    uint16_t access_date;
+    uint16_t first_cluster_high;    // High 16 bits of the data cluster
+    uint16_t modify_time;
+    uint16_t modify_date;
+    uint16_t first_cluster_low;     // Low 16 bits of the data cluster
+    uint32_t size;                  // File size in bytes
+}__attribute__((packed));
+
+// #pragma pack(pop)
+
+void fat32_init();
+void fat32_list_root();
+bool fat32_read_file(const char* target_name, const char* target_ext, uint8_t* out_buffer);
+int fat32_get_root_entries(FAT32_DirectoryEntry* out_buffer, int max_entries);
+
+
+
+\end{lstlisting}
+
+\subsection{gdt.cpp}
+\begin{lstlisting}[language={C++}]
+#include "gdt.h"
+#include "tss.h"
+extern struct tss_entry_t tss;
+GDT gdt[6];
+GDTR gdtr;
+
+void set_entry(int index, uint32_t base, uint32_t limit, uint8_t access, uint8_t granularity){
+    gdt[index].base_low = base & 0xFFFF;
+    gdt[index].base_middle = (base >> 16) & 0xFF;
+    gdt[index].base_high = (base >> 24) & 0xFF;
+    gdt[index].limit_low = limit & 0xFFFF;
+    gdt[index].access = access;
+    gdt[index].granularity = ((limit >> 16) & 0x0F) | granularity;
+}
+
+extern "C" void gdt_flush(GDTR*);
+
+void gdt_init(){
+    set_entry(0,0,0,0,0);
+    set_entry(1, 0, 0xFFFFFFFF, 0x9A, 0xCF);
+    set_entry(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
+    set_entry(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);
+    set_entry(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);
+    uint32_t tss_base = (uint32_t)&tss;
+    uint32_t tss_limit = sizeof(tss);
+    set_entry(5, tss_base, tss_limit, 0xE9, 0x00);
+    gdtr.limit = sizeof(gdt) - 1;
+    gdtr.base = (uint32_t)&gdt;
+    gdt_flush(&gdtr);
+}
+
+
+\end{lstlisting}
+
+\subsection{gdt.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#pragma pack(1)
+#include <stdint.h>
+struct GDT{
+    uint16_t limit_low, base_low;
+    uint8_t base_middle, access, granularity, base_high;
+};
+
+struct GDTR{
+    uint16_t limit;
+    uint32_t base;
+};
+
+void gdt_init();
+\end{lstlisting}
+
+\subsection{idt.cpp}
+\begin{lstlisting}[language={C++}]
+#include "idt.h"
+
+
+IDT idt[256];
+IDTR idtr;
+
+void idt_set_gate(int num, uint32_t base, uint16_t sel, uint8_t flag){
+    idt[num].base_low = base & 0xFFFF;
+    idt[num].base_high = (base >> 16) & 0xFFFF;
+    idt[num].sel = sel;
+    idt[num].zero = 0;
+    idt[num].flags = flag;
+}
+extern "C" void isr0(); extern "C" void isr1(); extern "C" void isr2(); extern "C" void isr3();
+extern "C" void isr4(); extern "C" void isr5(); extern "C" void isr6(); extern "C" void isr7();
+extern "C" void isr8(); extern "C" void isr9(); extern "C" void isr10(); extern "C" void isr11();
+extern "C" void isr12(); extern "C" void isr13(); extern "C" void isr14(); extern "C" void isr15();
+extern "C" void isr16(); extern "C" void isr17(); extern "C" void isr18(); extern "C" void isr19();
+extern "C" void isr20(); extern "C" void isr21(); extern "C" void isr22(); extern "C" void isr23();
+extern "C" void isr24(); extern "C" void isr25(); extern "C" void isr26(); extern "C" void isr27();
+extern "C" void isr28(); extern "C" void isr29(); extern "C" void isr30(); extern "C" void isr31();
+extern "C" void isr128();
+
+extern "C" void isr3();
+extern "C" void isr32();
+extern "C" void isr33();
+extern "C" void isr44();
+extern "C" void idt_flush(IDTR*);
+
+void idt_init(){
+    idtr.limit = sizeof(idt) - 1;
+    idtr.base = (uint32_t)&idt;
+    for(int i = 0; i<256; i++){
+        idt_set_gate(i, 0, 0, 0);
+    }
+    idt_set_gate(0, (uint32_t)isr0, 0x08, 0x8E); idt_set_gate(1, (uint32_t)isr1, 0x08, 0x8E);
+    idt_set_gate(2, (uint32_t)isr2, 0x08, 0x8E); idt_set_gate(3, (uint32_t)isr3, 0x08, 0x8E);
+    idt_set_gate(4, (uint32_t)isr4, 0x08, 0x8E); idt_set_gate(5, (uint32_t)isr5, 0x08, 0x8E);
+    idt_set_gate(6, (uint32_t)isr6, 0x08, 0x8E); idt_set_gate(7, (uint32_t)isr7, 0x08, 0x8E);
+    idt_set_gate(8, (uint32_t)isr8, 0x08, 0x8E); idt_set_gate(9, (uint32_t)isr9, 0x08, 0x8E);
+    idt_set_gate(10, (uint32_t)isr10, 0x08, 0x8E); idt_set_gate(11, (uint32_t)isr11, 0x08, 0x8E);
+    idt_set_gate(12, (uint32_t)isr12, 0x08, 0x8E); idt_set_gate(13, (uint32_t)isr13, 0x08, 0x8E);
+    idt_set_gate(14, (uint32_t)isr14, 0x08, 0x8E); idt_set_gate(15, (uint32_t)isr15, 0x08, 0x8E);
+    idt_set_gate(16, (uint32_t)isr16, 0x08, 0x8E); idt_set_gate(17, (uint32_t)isr17, 0x08, 0x8E);
+    idt_set_gate(18, (uint32_t)isr18, 0x08, 0x8E); idt_set_gate(19, (uint32_t)isr19, 0x08, 0x8E);
+    idt_set_gate(20, (uint32_t)isr20, 0x08, 0x8E); idt_set_gate(21, (uint32_t)isr21, 0x08, 0x8E);
+    idt_set_gate(22, (uint32_t)isr22, 0x08, 0x8E); idt_set_gate(23, (uint32_t)isr23, 0x08, 0x8E);
+    idt_set_gate(24, (uint32_t)isr24, 0x08, 0x8E); idt_set_gate(25, (uint32_t)isr25, 0x08, 0x8E);
+    idt_set_gate(26, (uint32_t)isr26, 0x08, 0x8E); idt_set_gate(27, (uint32_t)isr27, 0x08, 0x8E);
+    idt_set_gate(28, (uint32_t)isr28, 0x08, 0x8E); idt_set_gate(29, (uint32_t)isr29, 0x08, 0x8E);
+    idt_set_gate(30, (uint32_t)isr30, 0x08, 0x8E); idt_set_gate(31, (uint32_t)isr31, 0x08, 0x8E);
+    idt_set_gate(3, (uint32_t)isr3, 0x08, 0x8E);
+    idt_set_gate(32, (uint32_t)isr32, 0x08, 0x8E);
+    idt_set_gate(33, (uint32_t)isr33, 0x08, 0x8E);
+    idt_set_gate(128, (uint32_t)isr128, 0x08, 0xEE);
+    idt_set_gate(44, (uint32_t)isr44, 0x08, 0x8E);
+    idt_flush(&idtr);
+}
+\end{lstlisting}
+
+\subsection{idt.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#pragma pack(1)
+#include <stdint.h>
+
+struct IDT{
+    uint16_t base_low, sel;
+    uint8_t zero, flags;
+    uint16_t base_high;
+};
+
+struct IDTR{
+    uint16_t limit;
+    uint32_t base;
+};
+
+void idt_init();
+\end{lstlisting}
+
+\subsection{initrd.cpp}
+\begin{lstlisting}[language={C++}]
+#include "initrd.h"
+#include "vfs.h"
+#include "string.h"
+#include "vga.h"
+
+
+static uint32_t octal_to_int(const char* s) {
+    uint32_t result = 0;
+    while (*s) {
+        result = result * 8 + (*s - '0');
+        s++;
+    }
+    return result;
+}
+
+struct tar_header{
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char type;
+    char linkname[100];
+    char padding[255];
+}__attribute__((packed));
+
+static fs_node nodes[64];
+static tar_header* headers[64];
+static uint32_t file_count = 0;
+
+static uint32_t tarfs_read(fs_node* node, uint32_t offset, uint32_t size, char* buf) {
+    tar_header* hdr = headers[node->inode];
+    char* content = (char*)hdr + 512;
+    
+    if (offset > node->length) return 0;
+    if (offset + size > node->length) size = node->length - offset;
+    
+    for (uint32_t i = 0; i < size; i++) {
+        buf[i] = content[offset + i];
+    }
+    return size;
+}
+
+
+fs_node* initrd_init(uint32_t mod_start){
+    tar_header* hdr = (tar_header*) mod_start;
+    while(hdr->name[0] != '\0'){
+        uint32_t file_size = octal_to_int(hdr->size);
+        for(int i = 0; i<100; i++){
+            nodes[file_count].name[i] = hdr->name[i];
+        }
+        nodes[file_count].flags = VFS_FILE;
+        nodes[file_count].length = file_size;
+        nodes[file_count].inode = file_count;
+        nodes[file_count].read = tarfs_read;
+        headers[file_count] = hdr;
+        file_count++;
+        uint32_t blocks = (file_size + 511) / 512;
+        hdr = (tar_header*)((char*)hdr + 512 + blocks * 512);
+    }
+    return nodes;
+}
+fs_node* initrd_findfile(const char* file){
+    for(uint32_t i = 0; i<file_count; i++){
+        if(strcmp(nodes[i].name, file)){
+            return &nodes[i];
+        }
+    }
+    return 0;
+}
+void initrd_listfiles(){
+    for(uint32_t i = 0; i<file_count; i++){
+        vga_print(nodes[i].name);
+        vga_print(" ");
+    }
+    vga_print("\n");
+}
+\end{lstlisting}
+
+\subsection{initrd.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+#include "vfs.h"
+
+fs_node* initrd_init(uint32_t mod_start);
+fs_node* initrd_findfile(const char* name);
+void initrd_listfiles();
+\end{lstlisting}
+
+\subsection{io.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+static inline void outb(uint16_t port, uint8_t val){
+    asm volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
+}
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    asm volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) );
+    return ret;
+}
+
+static inline void io_wait(void) {
+    outb(0x80, 0);
+}
+
+static inline void insw(uint16_t port, void* addr, uint32_t count) {
+    asm volatile("cld; rep insw" : "+D"(addr), "+c"(count) : "d"(port) : "memory");
+}
+
+static inline void outsw(uint16_t port, const void* addr, uint32_t count) {
+    asm volatile("cld; rep outsw" : "+S"(addr), "+c"(count) : "d"(port) : "memory");
+}
+
+\end{lstlisting}
+
+\subsection{isr.cpp}
+\begin{lstlisting}[language={C++}]
+#include "vga.h"
+#include "pic.h"
+#include "io.h"
+#include "keyboard.h"
+#include "string.h"
+#include "memory.h"
+#include "timer.h"
+#include "initrd.h"
+
+struct regs_t {
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
+    uint32_t int_no, err_code;                 
+    uint32_t eip, cs, eflags, useresp, ss;  
+};
+
+// const char* message = "The Abyss is staring at you, mortal!!\n";
+extern char* message;
+const char* exception_messages[32] = {
+    "Division By Zero", "Debug", "Non Maskable Interrupt", "Breakpoint",
+    "Into Detected Overflow", "Out of Bounds", "Invalid Opcode", "No Coprocessor",
+    "Double Fault", "Coprocessor Segment Overrun", "Bad TSS", "Segment Not Present",
+    "Stack Fault", "General Protection Fault", "Page Fault", "Unknown Interrupt",
+    "Coprocessor Fault", "Alignment Check", "Machine Check", "Reserved", 
+    "Reserved", "Reserved", "Reserved", "Reserved", "Reserved", 
+    "Reserved", "Reserved", "Reserved", "Reserved", "Reserved", 
+    "Reserved", "Reserved"
+};
+
+extern "C" void fault_handler(const struct regs_t* r){
+    if(r->int_no < 32){
+        vga_clear();
+        vga_print("Abyss is angered!! Your connection with Abyss is severed!!\n");
+        vga_print(exception_messages[r->int_no]);
+    }else if(r->int_no == 128){
+        if(r->eax == 1){
+            char* add = (char*)r->ebx;
+            vga_print(add);
+        }
+
+    }
+    while(1){
+        asm volatile("cli");
+        asm volatile("hlt");
+    }
+}
+extern "C" void timer_tick(); 
+char keyboard_buffer[256];
+int buffer_ind = 0;
+void execute_command(){
+    keyboard_buffer[buffer_ind] = '\0';
+    vga_print("\n");
+    if(strcmp(keyboard_buffer, "clear")){
+        vga_clear();
+        vga_print(message);
+    }
+    else if(strcmp(keyboard_buffer, "hail")){
+        vga_print("THE OLDEST DARKNESS\n");
+    }
+    else if(strcmp(keyboard_buffer, "help")){
+        vga_print("These are the helping commands mortal :\n 1. clear\n 2. hail\n 3. alloc/malloc\n 4. uptime\n 5. cat <filename>\n 6. help\n 7. ls\n");
+    }
+    else if(strcmp(keyboard_buffer, "alloc") or strcmp(keyboard_buffer, "malloc")){
+        char* dynamic_string = (char*)malloc(20);
+        dynamic_string[0] = 'C';
+        dynamic_string[1] = 'o';
+        dynamic_string[2] = 'r';
+        dynamic_string[3] = 'r';
+        dynamic_string[4] = 'o';
+        dynamic_string[5] = 'd';
+        dynamic_string[6] = 'e';
+        dynamic_string[7] = '\0';
+        vga_print("The Abyss gave you some space and stated:\n");
+        vga_print(dynamic_string);
+        vga_print("\n");
+    }
+    else if(strcmp(keyboard_buffer, "uptime")){
+        uint32_t time = timer_get_ticks();
+        vga_print("The Abyss has been rampant for ");
+        char ch[256];
+        itoa(time, ch);
+        vga_print(ch);
+        vga_print(" ticks!!\n");
+    }else if(keyboard_buffer[0] == 'c' and keyboard_buffer[1] == 'a' and keyboard_buffer[2] == 't' and keyboard_buffer[3] == ' '){
+        char* filename = keyboard_buffer + 4;
+        fs_node* file = initrd_findfile(filename);
+        if(file){
+            char buf[512] = {0};
+            vfs_read(file, 0, file->length, buf);
+            vga_print(buf);
+            // vga_print("\n");
+        }else{
+            vga_print("No file named ");
+            vga_print(filename);
+            vga_print(" in inventory, mortal!!\n");
+        }
+    }else if(strcmp(keyboard_buffer, "ls")){
+        initrd_listfiles();
+    }
+    else if(buffer_ind > 0){
+        vga_print("Abyss knows no such thing as ");
+        vga_print("' ");
+        vga_print(keyboard_buffer);
+        vga_print(" '");
+        vga_print("\n");
+    }
+    buffer_ind = 0;
+    vga_print("Abyss >> ");
+}
+extern "C" void isr3_handler(){
+    vga_print("Interrupt 3 fired!!");
+}
+extern "C" void isr32_handler() {
+    timer_tick();
+    pic_send_eoi(0);
+}
+
+extern "C" void isr33_handler() {
+    uint8_t scancode = inb(0x60);
+    if (!(scancode & 0x80)) { 
+        char c = kbdus[scancode]; 
+        
+        if (c == '\n') {
+            execute_command(); 
+        } 
+        else if (c == '\b') {
+            if (buffer_ind> 0) {
+                buffer_ind--;
+                vga_print_char('\b');
+            }
+        } 
+        else if (c != 0 && buffer_ind < 255) { 
+            keyboard_buffer[buffer_ind] = c;
+            buffer_ind++;
+            vga_print_char(c);
+        }
+    }
+    pic_send_eoi(1); 
+}
+
+\end{lstlisting}
+
+\subsection{kernel.cpp}
+\begin{lstlisting}[language={C++}]
+#include "vga.h"
+#include "gdt.h"
+#include "idt.h"
+#include "pic.h"
+#include "paging.h"
+#include "tss.h"
+#include "memory.h"
+#include "timer.h"
+#include "task.h"
+#include "multiboot.h"
+#include "vfs.h"
+#include "initrd.h"
+#include "vesa.h"
+#include "mouse.h"
+#include "ui.h"
+#include "ata.h"
+#include "fat32.h"
+
+extern "C" void jump_usermode();
+extern "C" void test_user_function(){
+    const char* str = "Hello from User Mode via System Call!\n";
+    asm volatile(
+        "mov %0, %%eax;"
+        "mov %1, %%ebx;"
+        "int $0x80;"
+        : : "r"(1), "r"(str) : "eax", "ebx"
+    );
+    
+    while(1){}
+}
+const char* message = "The Abyss is staring at you, mortal!!\n";
+extern "C" void perform_task_switch();
+void task_a(){
+    while(1){
+        vga_print("A ");
+    }
+}
+void task_b(){
+    while(1){
+        vga_print("B ");
+    }
+}
+extern "C" void kernel_main(multiboot_info* mbd){
+    gdt_init();
+    uint32_t esp;
+    asm volatile("mov %%esp, %0" : "=r"(esp));
+    tss_init(esp);
+    idt_init();
+    pic_remap(32, 40);
+    init_paging();
+    memory_init();
+    timer_init(100);
+    init_tasking();
+    vesa_init((uint32_t)mbd->framebuffer_addr, mbd->framebuffer_width, mbd->framebuffer_height, mbd->framebuffer_pitch);
+    mouse_init();
+    ata_init();
+    uint8_t disk_buf[512];
+    for(int i = 0; i<512; i++) disk_buf[i] = 0;
+    const char* disk_msg = "The Hard drive is ready mortal!";
+    for(int i = 0; disk_msg[i] != '\0'; i++){
+        disk_buf[i] = disk_msg[i];
+    }
+    ata_write_sector(1, disk_buf);
+    vga_clear();
+    draw_rect(0, 0, 1024, 768, 0x000000);
+    fat32_init();
+    // fat32_list_root();
+
+    // uint8_t file_buffer[2048];
+    // for(int i = 0; i<2048; i++) file_buffer[i] = 0;
+    // if (fat32_read_file("HELLO   ", "TXT", file_buffer)) {
+    //     vga_print("\nRead from physical Hard Drive:\n> ");
+    //     vga_print((const char*)file_buffer);
+    //     vga_print("\n");
+    // }
+
+    // vesa_swap_buffers();
+    while(1){
+        ui_render();
+        vesa_swap_buffers();
+    }
+    // draw_gradient_rect(0,0,1024,768, 0x100010, 0x004554);
+    vga_print("Abyss v1.0 loading...\nLoading Virtual File System...\nFiles loaded...\n...\n...\nHello Mortal...");
+    if (mbd->mods_count > 0) {
+        multiboot_mod_list* mod = (multiboot_mod_list*)mbd->mods_addr;
+        initrd_init(mod->mod_start);
+        const char* name = "hell.txt";
+        fs_node* file = initrd_findfile(name);
+        if (file) {
+            char buf[128] = {0};
+            vfs_read(file, 0, file->length, buf);
+            vga_print("VFS Read: ");
+            vga_print(buf);
+            vga_print("\n");
+        }else{
+            vga_print("Filename ");
+            vga_print(name);
+            vga_print(" not found!!\n");
+        }
+    }else{
+        vga_print("ERROR : no initrd found!!");
+    }
+    vga_print(message);
+    vga_print("You want help? HAHA!! Type 'help', mortal\n");
+    vga_print("Abyss >> ");
+    // Task* t1 = (Task*)malloc(sizeof(Task));
+    // Task* t2 = (Task*)malloc(sizeof(Task));
+
+    // create_task(t1, task_a);
+    // create_task(t2, task_b);
+    asm volatile ("sti");
+    while(1){
+        ui_render();
+        asm volatile ("hlt");
+    }
+    // while(1){}
+    // asm volatile ("int $0x8");
+    // asm volatile ("sti");
+    // jump_usermode();
+    // while(1){}
+}
+\end{lstlisting}
+
+\subsection{keyboard.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+
+const char kbdus[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', /* 9 */
+  '9', '0', '-', '=', '\b', /* Backspace */
+  '\t', /* Tab */
+  'q', 'w', 'e', 'r', /* 19 */
+  't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', /* Enter key */
+    0,  /* 29   - Control */
+  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', /* 39 */
+ '\'', '`',   0,  /* Left shift */
+ '\\', 'z', 'x', 'c', 'v', 'b', 'n', /* 49 */
+  'm', ',', '.', '/',   0,  /* Right shift */
+  '*',
+    0,  /* Alt */
+  ' ',  /* Space bar */
+    0,  /* Caps lock */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* F1 to F10 keys */
+    0,  /* Num lock */
+    0,  /* Scroll Lock */
+    0,  /* Home key */
+    0,  /* Up Arrow */
+    0,  /* Page Up */
+  '-',
+    0,  /* Left Arrow */
+    0,
+    0,  /* Right Arrow */
+  '+',
+    0,  /* End key*/
+    0,  /* Down Arrow */
+    0,  /* Page Down */
+    0,  /* Insert Key */
+    0,  /* Delete Key */
+    0, 0, 0,
+    0,  /* F11 Key */
+    0,  /* F12 Key */
+    0, /* All other keys are undefined */
+};
+
+\end{lstlisting}
+
+\subsection{memory.cpp}
+\begin{lstlisting}[language={C++}]
+#include "memory.h"
+#include "vga.h"
+
+uint32_t heap_start = 0x200000;
+uint32_t current_heap_pointer;
+
+void memory_init(){
+    current_heap_pointer = heap_start;
+}
+void* malloc(size_t size){
+    uint32_t allocated_address = current_heap_pointer;
+    current_heap_pointer+=size;
+    if(current_heap_pointer >= 0x2000000){
+        vga_print("The Abyss is filled with your trash, mortal\n");
+        while(1){
+            asm volatile("cli; hlt");
+        }
+    }
+    return (void*)allocated_address;
+}
+\end{lstlisting}
+
+\subsection{memory.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+void memory_init();
+void* malloc(size_t size);
+\end{lstlisting}
+
+\subsection{mouse.cpp}
+\begin{lstlisting}[language={C++}]
+#include "mouse.h"
+#include "io.h"
+#include "vesa.h"
+#include "pic.h"
+#include "ui.h" // We will create this next!
+
+int mouse_x = 512;
+int mouse_y = 384;
+uint8_t mouse_cycle = 0;
+uint8_t mouse_byte[3];
+bool mouse_left_pressed = false; 
+
+const int CURSOR_W = 10;
+const int CURSOR_H = 15;
+const uint8_t cursor_bitmap[15][10] = {
+    {2,0,0,0,0,0,0,0,0,0},
+    {2,2,0,0,0,0,0,0,0,0},
+    {2,1,2,0,0,0,0,0,0,0},
+    {2,1,1,2,0,0,0,0,0,0},
+    {2,1,1,1,2,0,0,0,0,0},
+    {2,1,1,1,1,2,0,0,0,0},
+    {2,1,1,1,1,1,2,0,0,0},
+    {2,1,1,1,1,1,1,2,0,0},
+    {2,1,1,1,1,1,1,1,2,0},
+    {2,1,1,1,1,1,1,1,1,2},
+    {2,1,1,1,1,2,2,2,2,2},
+    {2,1,1,2,1,2,0,0,0,0},
+    {2,1,2,0,2,1,2,0,0,0},
+    {2,2,0,0,2,1,2,0,0,0},
+    {2,0,0,0,0,2,2,0,0,0}
+};
+
+void mouse_wait(uint8_t type){
+    uint32_t timeout = 100000;
+    if (type == 0) {
+        while (timeout--) { if ((inb(0x64) & 1) == 1) return; }
+    } else {
+        while (timeout--) { if ((inb(0x64) & 2) == 0) return; }
+    }
+}
+
+void mouse_write(uint8_t a_write) {
+    mouse_wait(1);
+    outb(0x64, 0xD4); 
+    mouse_wait(1);
+    outb(0x60, a_write);
+}
+
+uint8_t mouse_read() {
+    mouse_wait(0);
+    return inb(0x60);
+}
+
+void mouse_init() {
+    uint8_t status;
+    mouse_wait(1);
+    outb(0x64, 0xA8);
+    mouse_wait(1);
+    outb(0x64, 0x20); 
+    mouse_wait(0);
+    status = (inb(0x60) | 2);
+    mouse_wait(1);
+    outb(0x64, 0x60);
+    mouse_wait(1);
+    outb(0x60, status);
+    mouse_write(0xF6);
+    mouse_read();
+    mouse_write(0xF4);
+    mouse_read();
+}
+
+void mouse_draw() {
+    for (int i = 0; i < CURSOR_H; i++) {
+        for (int j = 0; j < CURSOR_W; j++) {
+            if (cursor_bitmap[i][j] == 1) {
+                put_pixel(mouse_x + j, mouse_y + i, 0x000000); 
+            } else if (cursor_bitmap[i][j] == 2) {
+                put_pixel(mouse_x + j, mouse_y + i, 0xFFFFFF); 
+            }
+        }
+    }
+}
+
+extern "C" void isr44_handler() {
+    uint8_t status = inb(0x64);
+    if ((status & 0x20) == 0) {
+        pic_send_eoi(12);
+        return; 
+    }
+    
+    mouse_byte[mouse_cycle] = inb(0x60); 
+    if (mouse_cycle == 0 && (mouse_byte[0] & 0x08) == 0) {
+        pic_send_eoi(12);
+        return;
+    }
+    
+    mouse_cycle++; 
+    if (mouse_cycle == 3) {
+        mouse_cycle = 0; 
+        mouse_left_pressed = (mouse_byte[0] & 0x01);
+        
+        int d_x = (int8_t)mouse_byte[1]; 
+        int d_y = (int8_t)mouse_byte[2]; 
+        
+        mouse_x += d_x;
+        mouse_y -= d_y; 
+        
+        if (mouse_x < 0) mouse_x = 0;
+        if (mouse_y < 0) mouse_y = 0;
+        if (mouse_x > 1023 - CURSOR_W) mouse_x = 1023 - CURSOR_W; 
+        if (mouse_y > 767 - CURSOR_H) mouse_y = 767 - CURSOR_H;   
+        
+        // Signal the UI to draw a new frame!
+        needs_redraw = true;
+    }
+    pic_send_eoi(12); 
+}
+
+\end{lstlisting}
+
+\subsection{mouse.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+extern int mouse_x;
+extern int mouse_y;
+extern uint8_t mouse_byte[3];
+extern bool mouse_left_pressed;
+
+void mouse_init();
+void mouse_draw();
+
+\end{lstlisting}
+
+\subsection{multiboot.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+struct multiboot_info {
+    uint32_t flags;
+    uint32_t mem_lower;
+    uint32_t mem_upper;
+    uint32_t boot_device;
+    uint32_t cmdline;
+    uint32_t mods_count;
+    uint32_t mods_addr;
+    uint32_t num;
+    uint32_t size;
+    uint32_t addr;
+    uint32_t shndx;
+    uint32_t mmap_length;
+    uint32_t mmap_addr;
+    uint32_t drives_length;
+    uint32_t drives_addr;
+    uint32_t config_table;
+    uint32_t boot_loader_name;
+    uint32_t apm_table;
+
+    uint32_t vbe_control_info;
+    uint32_t vbe_mode_info;
+    uint16_t vbe_mode;
+    uint16_t vbe_interface_seg;
+    uint16_t vbe_interface_off;
+    uint16_t vbe_interface_len;
+    
+    uint64_t framebuffer_addr;    // The physical RAM address where the screen starts
+    uint32_t framebuffer_pitch;   // How many BYTES make up one horizontal row of pixels
+    uint32_t framebuffer_width;   // Screen width in pixels (1024)
+    uint32_t framebuffer_height;  // Screen height in pixels (768)
+    uint8_t  framebuffer_bpp;     // Bits Per Pixel (32 = 4 bytes per pixel)
+    uint8_t  framebuffer_type;    // 1 = RGB color mode
+    uint8_t  color_info[6];       // Which bits are Red, Green, Blue
+} __attribute__((packed));
+
+struct multiboot_mod_list {
+    uint32_t mod_start; 
+    uint32_t mod_end; 
+    uint32_t cmdline;
+    uint32_t pad;
+} __attribute__((packed));
+
+\end{lstlisting}
+
+\subsection{paging.cpp}
+\begin{lstlisting}[language={C++}]
+#include "paging.h"
+
+struct page_directory_t page_directory __attribute__((aligned(4096)));
+struct page_table_t first_page_table __attribute__((aligned(4096)));
+
+extern "C" void load_page_directory(uint32_t*);
+extern "C" void enable_paging();
+
+// void init_paging(){
+//     for(int i = 0; i<1024; i++){
+//         page_directory.tablesPhysical[i] = 0x02;
+//     }
+//     for(int i = 0; i<1024; i++){
+//         first_page_table.page[i] = (i * 4096) | 7;
+//     }
+//     page_directory.tablesPhysical[0] = ((uint32_t)&first_page_table) | 7;
+//     load_page_directory(page_directory.tablesPhysical);
+//     enable_paging();
+// }
+void init_paging() {
+
+    for (int i = 0; i < 1024; i++) {
+        page_directory.tablesPhysical[i] = (i << 22) | 0x83;
+    }
+    load_page_directory(page_directory.tablesPhysical);
+    enable_paging();
+}
+
+\end{lstlisting}
+
+\subsection{paging.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+struct page_table_t{
+    uint32_t page[1024];
+};
+struct page_directory_t{
+    uint32_t tablesPhysical[1024];
+    struct page_table_t* tables[1024];
+};
+void init_paging();
+\end{lstlisting}
+
+\subsection{pic.cpp}
+\begin{lstlisting}[language={C++}]
+#include "pic.h"
+#include "io.h"
+
+#define PIC1_COMMAND 0x20
+#define PIC1_DATA    0x21
+#define PIC2_COMMAND 0xA0
+#define PIC2_DATA    0xA1
+
+#define ICW1_INIT    0x10
+#define ICW1_ICW4    0x01
+#define ICW4_8086    0x01
+
+void pic_remap(int offset1, int offset2) {
+    unsigned char a1, a2;
+    
+    // Save current masks
+    a1 = inb(PIC1_DATA);
+    a2 = inb(PIC2_DATA);
+    
+    // Start initialization sequence in cascade mode
+    outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4);
+    io_wait();
+    outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);
+    io_wait();
+    
+    // Set offsets (this is where we map it to 32 and 40)
+    outb(PIC1_DATA, offset1);
+    io_wait();
+    outb(PIC2_DATA, offset2);
+    io_wait();
+    
+    // Tell Master PIC that there is a Slave PIC at IRQ2 (0000 0100)
+    outb(PIC1_DATA, 4);
+    io_wait();
+    
+    // Tell Slave PIC its cascade identity (0000 0010)
+    outb(PIC2_DATA, 2);
+    io_wait();
+    
+    // 8086/88 (MCS-80/85) mode
+    outb(PIC1_DATA, ICW4_8086);
+    io_wait();
+    outb(PIC2_DATA, ICW4_8086);
+    io_wait();
+    
+    // Restore saved masks
+    outb(PIC1_DATA, a1);
+    outb(PIC2_DATA, a2);
+}
+
+// End of Interrupt (EOI) command
+void pic_send_eoi(unsigned char irq) {
+    if(irq >= 8)
+        outb(PIC2_COMMAND, 0x20); // Send to Slave
+    
+    outb(PIC1_COMMAND, 0x20); // Send to Master
+}
+
+\end{lstlisting}
+
+\subsection{pic.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+void pic_remap(int offset1, int offset2);
+void pic_send_eoi(unsigned char irq);
+\end{lstlisting}
+
+\subsection{string.cpp}
+\begin{lstlisting}[language={C++}]
+#include "string.h"
+
+bool strcmp(const char* a, const char* b){
+    int i = 0;
+    while(a[i] != '\0' and b[i] != '\0'){
+        if(a[i] != b[i]){
+            return false;
+        }
+        i++;
+    }
+    return (a[i] == '\0' and b[i] == '\0');
+}
+void itoa(int n, char st[]){
+    int i = 0;
+    bool is_neg = 0;
+    if(n == 0){
+        st[i++] = '0';
+        st[i] = '\0';
+        return;
+    }
+    if(n < 0){
+        n = -n;
+        is_neg = 1;
+    }
+    while(n != 0){
+        int r = n % 10;
+        n/=10;
+        st[i++] = '0' + r;
+    }
+    if(is_neg){
+        st[i++] = '-';
+    }
+    st[i] = '\0';
+    int start = 0, end = i-1;
+    while(start < end){
+        char temp = st[start];
+        st[start] = st[end];
+        st[end] = temp;
+        start++;
+        end--;
+    }
+}
+\end{lstlisting}
+
+\subsection{string.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+bool strcmp(const char* a, const  char* b);
+void itoa(int n, char st[]);
+\end{lstlisting}
+
+\subsection{task.cpp}
+\begin{lstlisting}[language={C++}]
+#include "task.h"
+#include "memory.h"
+#include "vga.h"
+
+Task* current_task;
+Task* ready_queue;
+uint32_t next_pid = 1;
+
+void init_tasking(){
+    asm volatile ("cli");
+    current_task = (Task*)malloc(sizeof(Task));
+    current_task->id = next_pid;
+    next_pid++;
+    current_task->esp = 0;
+    current_task->ebp = 0;
+    current_task->eip = 0;
+    current_task->next = current_task;
+    ready_queue = current_task;
+    asm volatile ("sti");
+}  
+
+void create_task(Task* new_task, void (*main)()){
+    uint32_t st = (uint32_t)malloc(4096);
+    uint32_t* stack = (uint32_t*)(st + 4096);
+    *(--stack) = 0x202;
+    *(--stack) = 0x08;
+    *(--stack) = (uint32_t)main;
+    for(int i = 0; i<8; i++){
+        *(--stack) = 0;
+    }
+    new_task->esp = (uint32_t)stack;
+    new_task->ebp = (uint32_t)stack;
+    new_task->eip = (uint32_t)main;
+    new_task->id = next_pid++;
+    new_task->next = current_task->next;
+    current_task->next = new_task;
+}
+\end{lstlisting}
+
+\subsection{task.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+struct Task{
+    uint32_t id;
+    uint32_t esp, ebp;
+    uint32_t eip;
+    Task* next;
+};
+
+void init_tasking();
+void create_task(Task* t, void (*main)());
+void switch_task();
+\end{lstlisting}
+
+\subsection{timer.cpp}
+\begin{lstlisting}[language={C++}]
+#include "timer.h"
+#include "io.h"
+
+uint32_t tick_count = 0;
+void timer_init(uint32_t frequency){
+    uint32_t divisor = 1193180 / frequency;
+    outb(0x43, 0x36);
+    uint8_t low = (uint32_t)(divisor & 0xFF);
+    uint8_t high = (uint32_t)((divisor >> 8) & 0xFF);
+    outb(0x40, low);
+    outb(0x40, high);
+}
+uint32_t timer_get_ticks(){
+    return tick_count;
+}
+extern "C" void timer_tick(){
+    tick_count++;
+}
+\end{lstlisting}
+
+\subsection{timer.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+void timer_init(uint32_t frequency);
+uint32_t timer_get_ticks();
+\end{lstlisting}
+
+\subsection{tss.cpp}
+\begin{lstlisting}[language={C++}]
+#include "tss.h"
+
+struct tss_entry_t tss;
+
+void tss_init(uint32_t kernel_stack) {
+    uint8_t* tss_bytes = (uint8_t*)&tss;
+    for (uint32_t i = 0; i < sizeof(tss); i++) {
+        tss_bytes[i] = 0;
+    }
+    tss.ss0 = 0x10;
+    tss.esp0 = kernel_stack;
+    tss.iomap_base = sizeof(tss);
+    asm volatile("ltr %%ax" : : "a"(0x2B));
+}
+
+\end{lstlisting}
+
+\subsection{tss.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+struct tss_entry_t {
+    uint32_t prev_tss;
+    uint32_t esp0; // The ring 0 stack pointer!
+    uint32_t ss0;  // The ring 0 stack segment!
+    uint32_t esp1;
+    uint32_t ss1;
+    uint32_t esp2;
+    uint32_t ss2;
+    uint32_t cr3;
+    uint32_t eip;
+    uint32_t eflags;
+    uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
+    uint32_t es, cs, ss, ds, fs, gs;
+    uint32_t ldt;
+    uint16_t trap;
+    uint16_t iomap_base;
+} __attribute__((packed));
+
+void tss_init(uint32_t kernel_stack);
+
+\end{lstlisting}
+
+\subsection{ui.cpp}
+\begin{lstlisting}[language={C++}]
+#include "ui.h"
+#include "vesa.h"
+#include "mouse.h"
+#include "fat32.h"
+
+bool needs_redraw = true; // Always draw the very first frame
+
+Window windows[3] = {
+    {100, 100, 400, 300, "Abyss OS Settings", false, 0, 0},
+    {550, 250, 400, 200, "System Monitor", false, 0, 0},
+    {200, 150, 350, 250, "File Explorer", false, 0, 0}
+};
+int num_windows = 3;
+
+// int num_windows = 2;
+
+void draw_window(uint32_t x, uint32_t y, uint32_t width, uint32_t height, const char* title) {
+    // Window Body
+    draw_rect(x, y, width, height, 0xCCCCCC); // Light gray
+    
+    // Window Borders (Creates a slight 90s 3D pop-out effect)
+    draw_rect(x, y, width, 1, 0xFFFFFF); // Top
+    draw_rect(x, y, 1, height, 0xFFFFFF); // Left
+    draw_rect(x + width - 1, y, 1, height, 0x555555); // Right
+    draw_rect(x, y + height - 1, width, 1, 0x555555); // Bottom
+    
+    // Title Bar
+    draw_rect(x + 2, y + 2, width - 4, 20, 0x0000AA); // Dark blue title bar
+    draw_string(title, x + 6, y + 8, 0xFFFFFF, 0x0000AA, 2); // White text
+}
+
+bool is_any_window_dragged = false;
+
+void ui_update() {
+    // 1. If the mouse is released, drop everything
+    if (!mouse_left_pressed) {
+        for (int i = 0; i < num_windows; i++) {
+            windows[i].is_dragged = false;
+        }
+        is_any_window_dragged = false;
+        return;
+    }
+
+    // 2. If we are currently dragging a window, ONLY update that specific window
+    if (is_any_window_dragged) {
+        for (int i = 0; i < num_windows; i++) {
+            Window* w = &windows[i];
+            if (w->is_dragged) {
+                w->x = mouse_x - w->drag_offset_x;
+                w->y = mouse_y - w->drag_offset_y;
+                needs_redraw = true;
+                return; // Exit early so we don't grab other windows!
+            }
+        }
+    }
+
+    // 3. If we aren't dragging anything yet, check for a NEW click!
+    for (int i = num_windows - 1; i >= 0; i--) {
+        Window* w = &windows[i];
+        
+        // Check collision with the ENTIRE WINDOW (so clicking the body brings it to front)
+        if (mouse_x >= w->x && mouse_x <= w->x + w->width &&
+            mouse_y >= w->y && mouse_y <= w->y + w->height) {
+            
+            // Bring to front! (If it's not already on top)
+            if (i != num_windows - 1) {
+                Window clicked_window = windows[i];
+                
+                // Shift all windows above it down by 1 position
+                for (int j = i; j < num_windows - 1; j++) {
+                    windows[j] = windows[j + 1];
+                }
+                
+                // Put our clicked window at the very end of the array (the top)
+                windows[num_windows - 1] = clicked_window;
+                
+                // Re-point 'w' to the new top window so dragging works
+                w = &windows[num_windows - 1];
+            }
+            
+            // Check if they specifically clicked the Title Bar to start dragging
+            if (mouse_y <= w->y + 24) {
+                w->is_dragged = true;
+                w->drag_offset_x = mouse_x - w->x;
+                w->drag_offset_y = mouse_y - w->y;
+                is_any_window_dragged = true;
+            }
+            
+            needs_redraw = true; // Force redraw to show it popped to the front!
+            break; 
+        }
+    }
+}
+
+
+
+void ui_render() {
+    ui_update(); // Process mouse clicks first!
+    
+    if (!needs_redraw) return;
+    // 1. Draw Background
+    draw_gradient_rect(0, 0, 1024, 768, 0x100010, 0x004554);
+    
+    // 2. Draw Windows from our array
+    for (int i = 0; i < num_windows; i++) {
+        Window* w = &windows[i];
+        draw_window(w->x, w->y, w->width, w->height, w->title);
+        if(w->title[0] == 'F' and w->title[1] == 'i'){
+            draw_rect(w->x + 2, w->y + 24, w->width - 4, w->height - 26, 0xFFFFFF);
+            FAT32_DirectoryEntry files[16];
+            int file_count = fat32_get_root_entries(files, 16);
+            int file_y = w->y + 30;
+            for (int f = 0; f < file_count; f++) {
+                draw_rect(w->x + 10, file_y, 16, 16, 0x0055AA);
+                
+                // Construct the filename string (8 chars name + '.' + 3 chars ext)
+                char filename[13];
+                int idx = 0;
+                for(int j=0; j<8; j++) if(files[f].name[j] != ' ') filename[idx++] = files[f].name[j];
+                filename[idx++] = '.';
+                for(int j=0; j<3; j++) if(files[f].ext[j] != ' ') filename[idx++] = files[f].ext[j];
+                filename[idx] = '\0';
+                
+                // Draw the text in black
+                draw_string(filename, w->x + 35, file_y + 4, 0x000000, 0xFFFFFF, 1);
+                
+                file_y += 24;
+            }
+        }
+    }
+    // 3. Draw Mouse
+    mouse_draw();
+    // 4. Swap buffers
+    vesa_swap_buffers();
+    
+    needs_redraw = false;
+}
+
+
+
+\end{lstlisting}
+
+\subsection{ui.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+struct Window {
+    int x, y;
+    int width, height;
+    const char* title;
+    
+    // State for dragging
+    bool is_dragged;
+    int drag_offset_x;
+    int drag_offset_y;
+};
+
+extern bool needs_redraw;
+void ui_render();
+
+\end{lstlisting}
+
+\subsection{vesa.cpp}
+\begin{lstlisting}[language={C++}]
+#include "vesa.h"
+#include "font8x8.h"
+#include "memory.h"
+
+// #include <stdlib.h>
+
+uint32_t* framebuffer;
+uint32_t* backbuffer;
+static uint32_t  fb_width;
+static uint32_t  fb_height;
+static uint32_t  fb_pitch;
+
+void vesa_init(uint32_t addr, uint32_t width, uint32_t height, uint32_t pitch) {
+    framebuffer = (uint32_t*)addr;
+    fb_width    = width;
+    fb_height   = height;
+    fb_pitch    = pitch;
+
+    backbuffer = (uint32_t*)malloc(width * height * 4);
+}
+void vesa_swap_buffers() {
+    uint32_t total_pixels = fb_width * fb_height;
+    uint32_t* src = backbuffer;
+    uint32_t* dst = framebuffer;
+    
+    // Hardware-accelerated memory copy
+    asm volatile (
+        "cld; rep movsl"
+        : "+S" (src), "+D" (dst), "+c" (total_pixels)
+        :
+        : "memory"
+    );
+}
+
+
+void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
+    if (x >= fb_width || y >= fb_height) return;
+    uint32_t index = y * fb_width + x;
+    backbuffer[index] = color;
+    // uint32_t offset = y * (fb_pitch / 4) + x;
+    // framebuffer[offset] = color;
+}
+uint8_t color_r(uint32_t c){
+    return (c >> 16) & 0xFF;
+}
+uint8_t color_g(uint32_t c){
+    return (c >> 8) & 0xFF;
+}
+uint8_t color_b(uint32_t c){
+    return c & 0xFF;
+}
+uint32_t get_pixel(uint32_t x, uint32_t y) {
+    if (x >= fb_width || y >= fb_height) return 0;
+    uint32_t offset = y * (fb_pitch / 4) + x;
+    return framebuffer[offset];
+}
+
+void draw_gradient_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color1, uint32_t color2){
+    for(uint32_t i = 0; i < h; i++){
+        uint8_t r1 = color_r(color1);
+        uint8_t r2 = color_r(color2);
+
+        uint8_t g1 = color_g(color1);
+        uint8_t g2 = color_g(color2);
+
+        uint8_t b1 = color_b(color1);
+        uint8_t b2 = color_b(color2);
+
+        uint8_t r = (int)r1 + (((int)r2 - (int)r1) * (int)i) / (int)h;
+        uint8_t g = (int)g1 + (((int)g2 - (int)g1) * (int)i) / (int)h;
+        uint8_t b = (int)b1 + (((int)b2 - (int)b1) * (int)i) / (int)h;
+
+        uint32_t color = (r << 16) | (g << 8) | b;
+        draw_rect(x, y + i, w, 1, color);
+    }
+}
+void draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color){
+    // Safety clipping
+    if (x >= fb_width || y >= fb_height) return;
+    if (x + width > fb_width) width = fb_width - x;
+    if (y + height > fb_height) height = fb_height - y;
+    
+    for (uint32_t i = 0; i < height; i++) {
+        // Calculate the row exactly once
+        uint32_t* row_ptr = &backbuffer[(y + i) * fb_width + x];
+        
+        // Fast fill across the row
+        for (uint32_t j = 0; j < width; j++) {
+            row_ptr[j] = color;
+        }
+    }
+}
+
+//Bresenham's line algo...
+void draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1); //abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = (y1 > y0) ? (y0 - y1) : (y1 - y0);//-abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    int e2;
+
+    while (1) {
+        put_pixel(x0, y0, color);
+        
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        
+        e2 = 2 * err;
+        
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+void draw_circle(int xc, int yc, int radius, uint32_t color) {
+    int x = radius;
+    int y = 0;
+    int err = 0;
+
+    while (x >= y) {
+        put_pixel(xc + x, yc + y, color); // Octant 1
+        put_pixel(xc + y, yc + x, color); // Octant 2
+        put_pixel(xc - y, yc + x, color); // Octant 3
+        put_pixel(xc - x, yc + y, color); // Octant 4
+        put_pixel(xc - x, yc - y, color); // Octant 5
+        put_pixel(xc - y, yc - x, color); // Octant 6
+        put_pixel(xc + y, yc - x, color); // Octant 7
+        put_pixel(xc + x, yc - y, color); // Octant 8
+
+        if (err <= 0) {
+            y += 1;
+            err += 2 * y + 1;
+        }
+        
+        if (err > 0) {
+            x -= 1;
+            err -= 2 * x + 1;
+        }
+    }
+}
+void fill_circle(int xc, int yc, int radius, uint32_t color) {
+    int x = radius;
+    int y = 0;
+    int err = 0;
+
+    while (x >= y) {
+        // Draw horizontal lines connecting the mirrored points
+        draw_line(xc - x, yc + y, xc + x, yc + y, color);
+        draw_line(xc - x, yc - y, xc + x, yc - y, color);
+        draw_line(xc - y, yc + x, xc + y, yc + x, color);
+        draw_line(xc - y, yc - x, xc + y, yc - x, color);
+
+        if (err <= 0) {
+            y += 1;
+            err += 2 * y + 1;
+        }
+        
+        if (err > 0) {
+            x -= 1;
+            err -= 2 * x + 1;
+        }
+    }
+}
+/*
+void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color){
+    for(uint8_t row = 0; row < 8; row++){
+        for(uint8_t col = 0; col < 8; col++){
+            uint8_t row_data = font8x8_basic[(uint8_t)c][row];
+            if(row_data >> col){
+                put_pixel(x + col, y + row, fg_color);
+            }else{
+                put_pixel(x + col, y + row, bg_color);
+            }
+        }
+    }
+}
+void draw_string(const char* str, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color){
+    uint32_t start_x = x;
+    while (*str != '\0') {
+        if (*str == '\n') {
+            x = start_x;
+            y += 8;
+        } else {
+            draw_char(*str, x, y, fg_color, bg_color);
+            x += 8;   
+        }
+        str++;
+    }
+}
+*/
+
+void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, [[maybe_unused]]uint32_t bg_color, int scale) {
+    uint8_t* glyph = font8x8_basic[(uint8_t)c];
+    
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            if ((glyph[row] >> col) & 1) {
+                draw_rect(x + (col * scale), y + (row * scale), scale, scale, fg_color);
+            } else {
+                // draw_rect(x + (col * scale), y + (row * scale), scale, scale, bg_color);
+            }
+        }
+    }
+}
+
+void draw_string(const char* str, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color, int scale){
+    uint32_t start_x = x;
+    while(*str != '\0'){
+        if (*str == '\n') {
+            x = start_x;
+            y += (8 * scale); 
+        } else {
+            draw_char(*str, x, y, fg_color, bg_color, scale);
+            x += (8 * scale);
+        }
+        str++;
+    }
+}
+
+
+
+\end{lstlisting}
+
+\subsection{vesa.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+
+uint8_t color_r(uint32_t c);
+uint8_t color_g(uint32_t c);
+uint8_t color_b(uint32_t c);
+uint32_t get_pixel(uint32_t x, uint32_t y);
+extern uint32_t* framebuffer;
+extern uint32_t* backbuffer; 
+
+// void vesa_init(uint32_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch);
+void vesa_swap_buffers();
+void draw_gradient_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,uint32_t color1, uint32_t color2);
+void vesa_init(uint32_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch);
+void put_pixel(uint32_t x, uint32_t y, uint32_t color);
+void draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color);
+void draw_line(int x0, int y0, int x1, int y1, uint32_t color);
+void draw_circle(int xc, int yc, int r, uint32_t color);
+void fill_circle(int xc, int yc, int r, uint32_t color);
+void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color, int scale);
+void draw_string(const char* str, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color, int scale);
+
+
+
+\end{lstlisting}
+
+\subsection{vfs.cpp}
+\begin{lstlisting}[language={C++}]
+#include "vfs.h"
+
+uint32_t vfs_read(fs_node* node, uint32_t offset, uint32_t size, char* buf){
+    if(node->read != 0){
+        return node->read(node, offset, size, buf);
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\subsection{vfs.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+#include <stdint.h>
+#define VFS_FILE 0x01
+#define VFS_DIRECTORY 0x02
+
+struct fs_node{
+    char name[128];
+    uint32_t flags; // like is the file a file or a directory
+    uint32_t length;
+    uint32_t inode;
+    uint32_t (*read)(fs_node*, uint32_t offset, uint32_t size, char* buf);
+};
+uint32_t vfs_read(fs_node* node, uint32_t offset, uint32_t size, char* buf);
+\end{lstlisting}
+
+\subsection{vga.cpp}
+\begin{lstlisting}[language={C++}]
+#include "vga.h"
+#include "vesa.h"
+// volatile unsigned short* vga = (volatile unsigned short*)0xB8000;
+// int row = 0, col = 0;
+// int cur_pos = 0;
+uint32_t TERM_START_X = 0;
+uint32_t TERM_START_Y = 0;
+uint32_t TERM_MAX_X = 1024;
+uint32_t TERM_MAX_Y = 768;
+
+uint32_t term_x = TERM_START_X;
+uint32_t term_y = TERM_START_Y;
+
+const int FONT_SCALE = 2;
+const uint32_t TERM_FG = 0xFFFFFF;
+const uint32_t TERM_BG = 0x000000;
+
+
+void vga_clear(){
+    // for(int i = 0; i<2000; i++){
+    //     vga[i] = (0x0F << 8) | ' ';
+    // }
+    // row = 0;
+    // col = 0;
+    // cur_pos = 0;
+    draw_rect(TERM_START_X, TERM_START_Y, TERM_MAX_X, TERM_MAX_Y, TERM_BG);
+    term_x = TERM_START_X;
+    term_y = TERM_START_Y;
+}
+// void vga_putchar(char ch){
+//     if(col == 80){
+//         col = 0;
+//         row++;
+//         vga_putchar(ch);
+//         return;
+//     }
+//     if(ch == '\n'){
+//         col = 0;
+//         row++;
+//     }else{
+//         vga[row * 80 + col] = (0x0F << 8) | ch;
+//         col++;
+//     }
+// }
+void scroll(){
+    // if(cur_pos >= 2000){
+    //     for(int i = 0; i < 24 * 80; i++){
+    //         vga[i] = vga[i + 80];
+    //     }
+    //     for (int i = 24 * 80; i < 25 * 80; i++) {
+    //         vga[i] = (0x0F << 8) | ' '; 
+    //     }
+    //     cur_pos = 24 * 80;
+    // }
+    if(term_y >= TERM_MAX_Y) vga_clear();
+}
+void vga_print_char(const char c){
+    if(term_x >= TERM_MAX_X){
+        // vga_print_char('\n');
+        term_x = TERM_START_X;
+        term_y += 8 * FONT_SCALE;
+    }
+    if(c == '\b'){
+        // if(cur_pos > 0){
+        //     cur_pos--;
+        //     vga[cur_pos] = (0x0F << 8) | ' ';
+        // }
+        if(term_x > TERM_START_X){
+            term_x -= 8 * FONT_SCALE;
+            draw_rect(term_x, term_y, 8 * FONT_SCALE, 8 * FONT_SCALE, TERM_BG);
+        }
+    } else if (c == '\n') {
+        // cur_pos = cur_pos + 80 - (cur_pos % 80);
+        term_x = TERM_START_X;
+        term_y += 8 * FONT_SCALE;
+    } else {
+        // vga[cur_pos] = (0x0F << 8) | c;
+        // cur_pos++;
+        draw_char(c, term_x, term_y, TERM_FG, TERM_BG, FONT_SCALE);
+        term_x+=8 * FONT_SCALE;
+    }
+    scroll();
+}
+void vga_print(const char* s){
+    for(int i = 0; s[i] != '\0'; i++){
+        vga_print_char(s[i]);
+    }
+}
+\end{lstlisting}
+
+\subsection{vga.h}
+\begin{lstlisting}[language={C++}]
+#pragma once
+void vga_clear();
+void vga_putchar(char);
+void vga_print_char(const char);
+void vga_print(const char*);
+\end{lstlisting}
+
+\subsection{linker.ld}
+\begin{lstlisting}[language={bash}]
+ENTRY(_start)
+
+SECTIONS{
+    . = 0x100000;
+    .text : { *(.multiboot) *(.text) }
+    .rodata : { *(.rodata) }
+    .data : { *(.data) }
+    .bss : { *(COMMON) *(.bss) }
+}
+\end{lstlisting}
+
+
+\section{Phase 26: Interactive File Reading}
+In Phase 26, we transformed the static GUI into an interactive File Explorer. 
+
+\subsection{Root Directory Chain Traversal}
+Initially, the FAT32 driver only read the first sector of the Root Directory, limiting the system to 16 file entries (or fewer if Long File Names were present). This was resolved by implementing a standard FAT cluster chain traversal using a \texttt{while} loop that continuously queried the File Allocation Table for the next cluster until the EOF marker (\texttt{0x0FFFFFF8}) was reached. This allowed the system to parse massively fragmented and heavily populated root directories across multiple physical disk sectors.
+
+\subsection{Interactive GUI Integration}
+We integrated mouse state tracking (comparing current vs. previous frame \texttt{mouse\_left\_pressed} states) to detect localized clicks within the \texttt{ui\_render} File Explorer bounds. Upon detecting a collision between the mouse cursor and a file's bounding box, the GUI triggered a physical ATA sector read from the virtual \texttt{disk.img} into a shared static memory buffer. 
+
+\subsection{The Notepad Application}
+A rudimentary Window Manager visibility system was implemented by adding a boolean \texttt{visible} flag to the core \texttt{Window} structure. When a file was clicked, the hidden Notepad window was toggled to visible and popped to the front of the rendering stack. The Notepad application successfully read the shared memory buffer and utilized the existing \texttt{draw\_string} routine to rasterize the physical file contents directly onto the graphical desktop.
+
+\end{document}
